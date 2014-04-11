@@ -1,12 +1,12 @@
 DIR=~/.dotfiles
 
 # install git
-sudo apt-get install -y git
+sudo apt-get install -y git > /dev/null
 
 # clone into dotfiles directory
-git clone https://github.com/zsalzbank/dotfiles.git $DIR
+git clone https://github.com/zsalzbank/dotfiles.git $DIR > /dev/null
 
 # install dotfiles
-pushd $DIR
+pushd $DIR > /dev/null
 make
-popd
+popd > /dev/null
