@@ -1,3 +1,3 @@
 Just run:
 
-    curl -L https://github.com/zsalzbank/dotfiles/blob/master/bootstrap.sh | sh
+    curl -L https://raw.githubusercontent.com/zsalzbank/dotfiles/master/bootstrap.sh | sh
