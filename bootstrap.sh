@@ -4,7 +4,7 @@ DIR=~/.dotfiles
 sudo apt-get install -y git > /dev/null
 
 # clone into dotfiles directory
-git clone https://github.com/zsalzbank/dotfiles.git $DIR > /dev/null
+git clone --recursive https://github.com/zsalzbank/dotfiles.git $DIR > /dev/null
 
 # install dotfiles
 pushd $DIR > /dev/null
