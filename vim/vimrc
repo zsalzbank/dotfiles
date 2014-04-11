@@ -1,0 +1,36 @@
+call pathogen#infect()
+syntax on
+filetype plugin indent on
+
+highlight clear SignColumn
+let g:gitgutter_enabled = 0
+
+autocmd FileType html setl sw=2 sts=2 et
+autocmd FileType php setl sw=2 sts=2 et
+autocmd FileType javascript setl sw=2 sts=2 et
+autocmd FileType python setl sw=2 sts=2 ts=2
+autocmd FileType c setl sw=2 sts=2 ts=2
+autocmd FileType cpp setl sw=2 sts=2 ts=2
+autocmd FileType ruby setl sw=2 sts=2 ts=2 et
+autocmd User Rails setl sw=2 sts=2 ts=2 et
+
+set list listchars=tab:>-
+:highlight SpecialKey ctermfg=darkgrey
+
+let g:html_indent_inctags = "html,body,head,tbody"
+let g:html_indent_script1 = "inc"
+let g:html_indent_style1 = "inc"
+
+:nnoremap <silent> <F5> :let _s=@/<Bar>:%s/\s\+$//e<Bar>:let @/=_s<Bar>:nohl<CR>
+
+highlight ExtraWhitespace ctermbg=darkgrey guibg=darkgrey
+match ExtraWhitespace /\s\+$/
+autocmd BufWinEnter * match ExtraWhitespace /\s\+$/
+autocmd InsertEnter * match ExtraWhitespace /\s\+\%#\@<!$/
+autocmd InsertLeave * match ExtraWhitespace /\s\+$/
+autocmd BufWinLeave * call clearmatches()
+
+" vim-rspec-focus
+:nnoremap <leader>t :AddFocusTag<CR>
+:nnoremap <leader>r :RemoveAllFocusTags<CR>
+:nnoremap <leader>f :RemoveAllFocusTags<CR> :AddFocusTag<CR>

@@ -1,0 +1,9 @@
+[user]
+	name = Zachary Salzbank
+	email = zsalzbank@gmail.com
+[color]
+	ui = true
+[core]
+	pager = less -x2
+[alias]
+	dc = diff --cached
