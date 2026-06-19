@@ -1,0 +1,6 @@
+# Machine-specific overrides — never committed.
+bash/bashrc.d/99-local.sh
+*.local.sh
+
+# Backups created by install.sh.
+*.backup.*
