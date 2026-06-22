@@ -68,6 +68,19 @@ install_claude_settings() {
   fi
 }
 
+# Copy the personal CLAUDE.md into the durable per-user share so it's @imported
+# by the workspace's org CLAUDE.md. Only runs when /mnt/personal is mounted.
+install_claude_personal() {
+  local src="$REPO_DIR/claude/CLAUDE.personal.md"
+  local dest="/mnt/personal/CLAUDE.personal.md"
+  if [[ ! -d /mnt/personal ]]; then
+    info "/mnt/personal not present; skipping CLAUDE.personal.md"
+    return 0
+  fi
+  cp "$src" "$dest"
+  info "installed $dest"
+}
+
 # install_git_script <target> <upstream-url> <candidate-path>...
 # Copy the first existing candidate to <target>; otherwise download upstream.
 install_git_script() {
@@ -128,5 +141,8 @@ install_git_script "$HOME/.git-completion.bash" "$GIT_COMPLETION_URL" \
 
 # 3) Claude Code settings (e.g. disable commit/PR attribution).
 install_claude_settings
+
+# 4) Personal CLAUDE.md into the durable per-user share.
+install_claude_personal
 
 echo "Done. Open a new shell or run: source ~/.bash_profile"
