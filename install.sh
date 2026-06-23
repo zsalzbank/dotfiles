@@ -3,7 +3,8 @@
 # install.sh — symlink dotfiles into $HOME and fetch the git helper scripts.
 #
 # Safe to re-run (idempotent). Backs up any pre-existing real files it would
-# replace to "<file>.backup.<timestamp>". Manages no secrets.
+# replace to "<file>.backup.<timestamp>". Stores no secrets: the GitHub
+# credential helper reads the PAT from $PERSONAL_GITHUB_PAT at push time.
 
 set -euo pipefail
 
@@ -66,6 +67,33 @@ install_claude_settings() {
     info "jq unavailable; cannot safely merge $dest. Add this manually:"
     cat "$repo_settings"
   fi
+}
+
+# Wire the repo-local GitHub credential helper so pushes from this dotfiles repo
+# authenticate with a personal PAT over HTTPS, instead of any org/machine GitHub
+# credential that can't reach personal repos. Only runs when $PERSONAL_GITHUB_PAT
+# is set; the token itself is never written to disk.
+install_git_credential_helper() {
+  if [[ -z "${PERSONAL_GITHUB_PAT:-}" ]]; then
+    info "PERSONAL_GITHUB_PAT not set; skipping GitHub credential helper setup"
+    return 0
+  fi
+  local helper="$REPO_DIR/bin/git-credential-personal.sh"
+  chmod +x "$helper"
+  # SSH can't traverse an HTTP-only proxy and won't use a credential helper, so
+  # rewrite an ssh origin to HTTPS.
+  local origin
+  origin="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
+  if [[ "$origin" == git@github.com:* ]]; then
+    git -C "$REPO_DIR" remote set-url origin "https://github.com/${origin#git@github.com:}"
+    info "rewrote origin to HTTPS: $(git -C "$REPO_DIR" remote get-url origin)"
+  fi
+  # Reset inherited helpers (the empty value must come first so it clears helpers
+  # from earlier config files), then add ours.
+  git -C "$REPO_DIR" config --unset-all credential.helper 2>/dev/null || true
+  git -C "$REPO_DIR" config --add credential.helper ""
+  git -C "$REPO_DIR" config --add credential.helper "$helper"
+  info "configured repo-local GitHub credential helper -> $helper"
 }
 
 # Copy the personal CLAUDE.md into the durable per-user share so it's @imported
@@ -144,5 +172,8 @@ install_claude_settings
 
 # 4) Personal CLAUDE.md into the durable per-user share.
 install_claude_personal
+
+# 5) GitHub credential helper (only when PERSONAL_GITHUB_PAT is set).
+install_git_credential_helper
 
 echo "Done. Open a new shell or run: source ~/.bash_profile"
