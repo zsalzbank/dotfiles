@@ -69,6 +69,25 @@ install_claude_settings() {
   fi
 }
 
+# Install the Claude Code plugins I always want available. Plugins live under
+# ~/.claude, which is wiped on every workspace rebuild, so reinstall them here.
+# Idempotent: `claude plugin install` is a no-op when already installed. Skips
+# entirely when the claude CLI isn't on PATH, and never aborts the script.
+install_claude_plugins() {
+  if ! command -v claude >/dev/null 2>&1; then
+    info "claude CLI not found; skipping plugin install"
+    return 0
+  fi
+  local plugin
+  for plugin in figma@claude-plugins-official slack@claude-plugins-official; do
+    if claude plugin install "$plugin" --scope user >/dev/null 2>&1; then
+      info "installed Claude plugin $plugin"
+    else
+      info "could not install Claude plugin $plugin (network or marketplace unavailable?)"
+    fi
+  done
+}
+
 # Wire the repo-local GitHub credential helper so pushes from this dotfiles repo
 # authenticate with a personal PAT over HTTPS, instead of any org/machine GitHub
 # credential that can't reach personal repos. Only runs when $PERSONAL_GITHUB_PAT
@@ -172,6 +191,9 @@ install_claude_settings
 
 # 4) Personal CLAUDE.md into the durable per-user share.
 install_claude_personal
+
+# 4b) Claude Code plugins (figma, slack) — only when the claude CLI is present.
+install_claude_plugins
 
 # 5) GitHub credential helper (only when PERSONAL_GITHUB_PAT is set).
 install_git_credential_helper
