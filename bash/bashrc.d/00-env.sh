@@ -11,3 +11,5 @@ export NX_PARALLEL=8
 
 # Claude Code
 export CLAUDE_CODE_SCROLL_SPEED=8
+
+export NO_MATCHING=1
