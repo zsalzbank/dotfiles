@@ -115,6 +115,19 @@ install_git_credential_helper() {
   info "configured repo-local GitHub credential helper -> $helper"
 }
 
+# Mark the dotfiles repo as a git safe.directory. It lives on the /mnt/personal
+# share owned by nobody:nogroup, so without this git refuses operations here with
+# a "dubious ownership" error. ~/.gitconfig is wiped on rebuild, so re-apply each
+# run. Idempotent: --add is a no-op when the entry already exists.
+mark_dotfiles_safe_directory() {
+  git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$REPO_DIR" && {
+    info "safe.directory already includes $REPO_DIR"
+    return 0
+  }
+  git config --global --add safe.directory "$REPO_DIR"
+  info "marked $REPO_DIR as a git safe.directory"
+}
+
 # Copy the personal CLAUDE.md into the durable per-user share so it's @imported
 # by the workspace's org CLAUDE.md. Only runs when /mnt/personal is mounted.
 install_claude_personal() {
@@ -211,6 +224,9 @@ install_claude_personal
 
 # 4b) Claude Code plugins (figma, slack) — only when the claude CLI is present.
 install_claude_plugins
+
+# 4c) Mark the dotfiles repo as a git safe.directory (dubious-ownership fix).
+mark_dotfiles_safe_directory
 
 # 5) GitHub credential helper (only when PERSONAL_GITHUB_PAT is set).
 install_git_credential_helper
