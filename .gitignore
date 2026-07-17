@@ -4,3 +4,7 @@ bash/bashrc.d/99-local.sh
 
 # Backups created by install.sh.
 *.backup.*
+
+# Python bytecode.
+__pycache__/
+*.pyc
