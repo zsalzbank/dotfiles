@@ -2,6 +2,7 @@
 
 > **Editing these instructions:** the source of truth is this file at `/mnt/personal/dotfiles/claude/CLAUDE.personal.md`. The `install.sh` in this dotfiles repo `cp`s it to `/mnt/personal/CLAUDE.personal.md` on every workspace start, so any edit to that generated copy is overwritten. When I ask you to change my personal instructions / dotfiles config, edit THIS file (and the generated copy too if the change should take effect in the current session).
 
+- My local machine is a **Mac (macOS)**. When giving me instructions to run on my own machine — shell commands, app launch paths, keyboard shortcuts, install steps — assume macOS, not Linux (the devspaces workspace itself is Linux; this is about *my laptop*).
 - Never make a PR or commit unless explicitly asked to. Exception: you may commit and push minor changes to an existing PR when fixing a CI problem.
 - Never commit or push on your own. After making fixes or changes, wait for me to explicitly tell you to commit/push — this applies to everything, including skills like `plan-from-pr-comments` and `plan-from-ci-failures` that might otherwise do it automatically.
 - Never post a comment to any third-party service (GitHub, Notion, Figma, etc.) unless I specifically ask you to.
