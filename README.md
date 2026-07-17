@@ -27,9 +27,13 @@ dotfiles/
 │   ├── 40-rtk.sh           # install + verify pinned rtk, enable it, telemetry off
 │   ├── 50-git-safe-directory.sh  # mark this repo a git safe.directory
 │   ├── 60-git-credential.sh      # repo-local GitHub PAT credential helper
-│   └── 70-canals-env.sh    # seed canals .env.local overrides
+│   ├── 70-canals-env.sh    # seed canals .env.local overrides
+│   └── 80-devspaces-hooks.sh     # install PR-status hooks to /mnt/personal/hooks
 ├── bin/                    # helper scripts (e.g. git-credential-personal.sh)
 ├── claude/                 # settings.json + CLAUDE.personal.md installed by 30
+├── hooks/                  # devspaces pr-status-changed hooks (installed by 80)
+│   ├── lib/hooklib.py            # payload parse + episode dedup + detached inject
+│   └── pr-status-changed/        # review-comments / merge-conflict / ci-failures (Python)
 └── bash/
     ├── .bash_profile       # loader — sources everything in ~/.bashrc.d/*.sh
     └── bashrc.d/
@@ -85,6 +89,43 @@ the latest version from the upstream git repository.
 (repo values win on conflicts, existing settings preserved) using `jq`. If `jq`
 isn't installed it's installed via `apt-get` (Ubuntu). Currently this disables
 Claude's commit/PR attribution.
+
+## Devspaces PR-status hooks
+
+`80-devspaces-hooks.sh` installs the Python hooks in `hooks/` onto the personal
+volume (`/mnt/personal/hooks/`), where the devspaces in-pod agent runs them when
+a PR I opened from a workspace changes (a `pr-status-changed` event). Each hook
+reacts to the payload and **types a command into the running Claude session** by
+shelling out to `devspaces agent send-message` (see below):
+
+| Hook                 | Fires when                          | Injects                                              |
+| -------------------- | ----------------------------------- | --------------------------------------------------- |
+| `review-comments.py` | PR gains unresolved review comments | `/plan-from-pr-comments`                            |
+| `merge-conflict.py`  | PR develops a merge conflict        | `/merge-master`                                     |
+| `ci-failures.py`     | checks rollup goes `failure`        | run `plan-from-ci-failures` in a background subagent |
+
+`hooklib.py` parses the event, dedups with per-episode marker files (the
+dispatcher delivers at-least-once and re-fires on every rollup change), and
+launches `devspaces agent send-message --wait-idle "<text>"` **detached**,
+so the hook returns under the agent's 60s timeout while the CLI does the waiting
+and typing.
+
+The `devspaces agent send-message` command (in the devspaces CLI) owns the
+injection: it resolves the `zmx` session, and with `--wait-idle` injects
+immediately if Claude is busy (Claude queues it) or waits until the screen has
+been idle (`--idle-secs`, default 30s — i.e. the user paused) otherwise, then
+bracketed-pastes + submits. Only the `cli` frontend has a TUI; on web/bot it
+no-ops. **Requires a devspaces build that includes `send-message`.**
+
+Hooks install **disabled**. Enable them per workspace:
+
+```sh
+devspaces hooks list
+devspaces hooks enable ci-failures.py review-comments.py merge-conflict.py
+```
+
+Test a hook offline with `DEVSPACES_HOOK_DRYRUN=1 python3 hooks/pr-status-changed/ci-failures.py "$(cat payload.json)"`
+(prints what it would inject instead of sending).
 
 ## rtk (Rust Token Killer)
 
