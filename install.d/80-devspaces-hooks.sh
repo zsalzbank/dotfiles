@@ -1,10 +1,16 @@
-# Devspaces workspace hooks: PR-status events that type into the running Claude
-# session (see hooks/ in this repo and devspaces .claude/hooks.md).
+# Devspaces workspace hooks: copy the shared lib + every per-event hook onto the
+# personal volume (/mnt/personal/hooks/), where the in-pod `devspaces agent`
+# runtime discovers and runs them. Two hook families live here:
 #
-# Copies the shared lib + per-event hooks (Python) onto the personal volume,
-# where the in-pod `devspaces agent` dispatcher runs them. The actual injection
-# is done by `devspaces workspaces send-message`, which the hooks shell out to.
-# Installs them DISABLED — enable per workspace with `devspaces hooks enable`.
+#   pr-status-changed/*  react to a PR I opened changing (CI, review comments,
+#                        merge conflict) by typing a command into the running
+#                        Claude session (via `devspaces agent send-message`).
+#   shutdown/*           run at pod teardown (stop/destroy) — e.g. back up
+#                        Claude sessions to /mnt/personal before the pod goes away.
+#
+# Installs them all DISABLED — enable per workspace with `devspaces hooks enable`
+# (add `--global` to enable for every workspace). Each hook dir under hooks/ maps
+# to one devspaces hook event; hooks/lib/ is shared code, not an event.
 
 install_devspaces_hooks() {
   if [[ ! -d /mnt/personal ]]; then
@@ -13,10 +19,6 @@ install_devspaces_hooks() {
   fi
 
   local hooks_root="/mnt/personal/hooks"
-  local lib_src="$REPO_DIR/hooks/lib/hooklib.py"
-  local lib_dest_dir="$hooks_root/lib"
-  local event_src="$REPO_DIR/hooks/pr-status-changed"
-  local event_dest="$hooks_root/pr-status-changed"
 
   # copy_hook_file <src> <dest> [+x]: install one file, backing up a differing
   # real file first (mirrors the repo's backup convention).
@@ -32,27 +34,40 @@ install_devspaces_hooks() {
 
   # Drop any stale bash-era files from an earlier version of this feature so the
   # dispatcher doesn't run both.
-  rm -f "$event_dest"/*.sh "$lib_dest_dir/claude-inject.sh" 2>/dev/null || true
+  rm -f "$hooks_root/pr-status-changed"/*.sh "$hooks_root/lib/claude-inject.sh" 2>/dev/null || true
 
   # Shared lib. Lives under hooks/lib (NOT an event dir), so the dispatcher and
   # `devspaces hooks list` — both keyed on the fixed event-type list — ignore it.
   # Imported (not exec'd), so no +x needed.
+  local lib_dest_dir="$hooks_root/lib"
   mkdir -p "$lib_dest_dir"
-  copy_hook_file "$lib_src" "$lib_dest_dir/hooklib.py"
-  info "installed hook lib -> $lib_dest_dir/hooklib.py"
-
-  # Per-event hooks (executable).
-  mkdir -p "$event_dest"
   local f name
-  for f in "$event_src"/*.py; do
-    [[ -e "$f" ]] || continue
+  for f in "$REPO_DIR"/hooks/lib/*; do
+    [[ -f "$f" ]] || continue
     name="$(basename "$f")"
-    copy_hook_file "$f" "$event_dest/$name" +x
-    info "installed hook $name -> $event_dest/$name"
+    copy_hook_file "$f" "$lib_dest_dir/$name"
+    info "installed hook lib -> $lib_dest_dir/$name"
   done
 
-  info "devspaces hooks installed (disabled). Enable per workspace with:"
+  # Per-event hooks (executable). Iterate every event dir under hooks/ (all but
+  # lib/) so a new event family needs no change here — just drop its dir in.
+  local event_dir event dest
+  for event_dir in "$REPO_DIR"/hooks/*/; do
+    event="$(basename "$event_dir")"
+    [[ "$event" == "lib" ]] && continue
+    dest="$hooks_root/$event"
+    mkdir -p "$dest"
+    for f in "$event_dir"*; do
+      [[ -f "$f" ]] || continue
+      name="$(basename "$f")"
+      copy_hook_file "$f" "$dest/$name" +x
+      info "installed hook $event/$name -> $dest/$name"
+    done
+  done
+
+  info "devspaces hooks installed (disabled). Enable per workspace with e.g.:"
   info "  devspaces hooks enable ci-failures.py review-comments.py merge-conflict.py"
+  info "  devspaces hooks enable backup-sessions.py   # shutdown: back up sessions"
 }
 
 install_devspaces_hooks

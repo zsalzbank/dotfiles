@@ -28,12 +28,13 @@ dotfiles/
 │   ├── 50-git-safe-directory.sh  # mark this repo a git safe.directory
 │   ├── 60-git-credential.sh      # repo-local GitHub PAT credential helper
 │   ├── 70-canals-env.sh    # seed canals .env.local overrides
-│   └── 80-devspaces-hooks.sh     # install PR-status hooks to /mnt/personal/hooks
+│   └── 80-devspaces-hooks.sh     # install workspace hooks to /mnt/personal/hooks
 ├── bin/                    # helper scripts (e.g. git-credential-personal.sh)
 ├── claude/                 # settings.json + CLAUDE.personal.md installed by 30
-├── hooks/                  # devspaces pr-status-changed hooks (installed by 80)
+├── hooks/                  # devspaces workspace hooks (installed by 80)
 │   ├── lib/hooklib.py            # payload parse + episode dedup + detached inject
-│   └── pr-status-changed/        # review-comments / merge-conflict / ci-failures (Python)
+│   ├── pr-status-changed/        # review-comments / merge-conflict / ci-failures (Python)
+│   └── shutdown/                 # backup-sessions.py — back up Claude sessions at teardown
 └── bash/
     ├── .bash_profile       # loader — sources everything in ~/.bashrc.d/*.sh
     └── bashrc.d/
@@ -90,13 +91,20 @@ the latest version from the upstream git repository.
 isn't installed it's installed via `apt-get` (Ubuntu). Currently this disables
 Claude's commit/PR attribution.
 
-## Devspaces PR-status hooks
+## Devspaces workspace hooks
 
 `80-devspaces-hooks.sh` installs the Python hooks in `hooks/` onto the personal
-volume (`/mnt/personal/hooks/`), where the devspaces in-pod agent runs them when
-a PR I opened from a workspace changes (a `pr-status-changed` event). Each hook
-reacts to the payload and **types a command into the running Claude session** by
-shelling out to `devspaces agent send-message` (see below):
+volume (`/mnt/personal/hooks/`), where the devspaces in-pod agent discovers and
+runs them. Each subdir of `hooks/` (other than `lib/`) is one hook *event*; the
+installer walks them generically, so adding a new event family is just dropping
+a new dir in `hooks/` — no change to `80-devspaces-hooks.sh`. All hooks are
+invoked with the event JSON as `argv[1]` and install **disabled**.
+
+### `pr-status-changed/` — react to a PR I opened changing
+
+Fires when a PR I opened from a workspace changes. Each hook reacts to the
+payload and **types a command into the running Claude session** by shelling out
+to `devspaces agent send-message` (see below):
 
 | Hook                 | Fires when                          | Injects                                              |
 | -------------------- | ----------------------------------- | --------------------------------------------------- |
@@ -126,6 +134,38 @@ devspaces hooks enable ci-failures.py review-comments.py merge-conflict.py
 
 Test a hook offline with `DEVSPACES_HOOK_DRYRUN=1 python3 hooks/pr-status-changed/ci-failures.py "$(cat payload.json)"`
 (prints what it would inject instead of sending).
+
+### `shutdown/` — back up Claude sessions at teardown
+
+`backup-sessions.py` runs at pod teardown (stop *or* destroy), via the devspaces
+`shutdown` hook event (see devspaces PR #399). Claude Code's session transcripts
+under `~/.claude/projects/` are per-pod and vanish when the pod is torn down;
+this copies every transcript into the durable personal share, bucketed by the
+ISO week (UTC) of the session's last edit, so a weekly `claude insights` pass can
+distill learnings across every workspace:
+
+```
+/mnt/personal/claude-sessions/<YYYY-Www>/<session-id>.jsonl
+```
+
+See the docstring in `hooks/shutdown/backup-sessions.py` for the full rules
+(week bucketing, one-bucket-per-session pruning, why the session UUID is a
+sufficient key). Enable it (its trigger runs on the way down, so there's nothing
+to "see" until the next stop/destroy):
+
+```sh
+devspaces hooks enable backup-sessions.py     # or --global for every workspace
+```
+
+Test it offline against the real session data with:
+
+```sh
+python3 hooks/shutdown/backup-sessions.py '{"type":"shutdown","toStatus":"stopping"}'
+```
+
+> Requires a devspaces build that includes the `shutdown` hook event (PR #399).
+> Until that ships, `devspaces hooks list` won't surface it — the file is
+> installed and ready regardless.
 
 ## rtk (Rust Token Killer)
 
