@@ -29,7 +29,13 @@ install_devspaces_hooks() {
       mv "$dest" "$dest.backup.$TIMESTAMP"
     fi
     cp "$src" "$dest"
-    [[ "$exec" == "+x" ]] && chmod +x "$dest"
+    # `if`, not `[[ … ]] && chmod`: the && form makes the function's exit status 1
+    # on every non-`+x` call (the lib files below), and install.sh runs under
+    # `set -e` — which aborted the whole dotfiles install here, silently skipping
+    # this module and every later one.
+    if [[ "$exec" == "+x" ]]; then
+      chmod +x "$dest"
+    fi
   }
 
   # Drop any stale bash-era files from an earlier version of this feature so the
