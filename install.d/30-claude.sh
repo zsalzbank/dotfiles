@@ -64,7 +64,7 @@ install_claude_plugins() {
     return 0
   fi
   local plugin
-  for plugin in figma@claude-plugins-official slack@claude-plugins-official; do
+  for plugin in figma@claude-plugins-official; do
     if claude plugin install "$plugin" --scope user >/dev/null 2>&1; then
       info "installed Claude plugin $plugin"
     else
