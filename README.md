@@ -209,9 +209,21 @@ Reports land in `/mnt/personal/claude-insights/`. The first three shell out to
   messages, AskUserQuestion stalls and how often they were rejected, refused tool
   calls, missing commands, hook errors and per-hook latency, context
   compactions, oversized tool results, files re-derived across many sessions,
-  subagent cost-vs-return, and which skills actually ran. Read the **Alarms**
+  subagent cost-vs-return, and which skills actually ran. It also reports which
+  skill and file were in play when a correction landed, completion claims the next
+  message disputed, corrections repeated inside one session, questions asked in
+  more than one session, conventions being re-explained ("like the others" —
+  each cluster is a skill nobody wrote down), and hook injections counted
+  *before* dedup so repeat firings on one PR stay visible. Read the **Alarms**
   block; the correction-pattern profile is a stable fingerprint week to week and
   says little on its own.
+
+  Messages are read whole, with pasted output stripped at the first `>>`/`====`
+  marker and numbered lists split into their individual items — the earlier
+  length cap skipped 30% of messages, and slash-command bodies (which arrive as
+  user text and read like emphatic instructions) were being counted as
+  corrections. Any count taken before that is inflated and length-biased, so
+  normalise by interactive session count and don't compare across the fix.
 - **`friction-review`** → `<week>-friction-review.md` — the interpretation half,
   and the one worth reading weekly. Hands the model the complete `friction`
   corpus (not a file sample) plus `friction-ledger.md`, a running list of

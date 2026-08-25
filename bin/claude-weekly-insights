@@ -244,8 +244,132 @@ def _text_of(content):
     return "" if content is None else json.dumps(content)
 
 
+# Pasted data, not typed prose. A long message is usually a short instruction
+# followed by a wall of log/JSON/table output, so the fix is to strip the data and
+# scan what's left rather than to skip the message on length: 30% of messages were
+# over the old 1200-char cap and held ~329 unseen corrections.
+FENCE_RE = re.compile(r"```.*?```", re.S)
+DATA_LINE_RE = re.compile(
+    r"^\s*[\[{\}\]]"                       # JSON-ish
+    r"|^\s*[-=_*]{6,}\s*$"                 # rules / separators
+    r"|^\s*\|.*\|"                         # table rows
+    r"|HTTP/?\d|HTTP \d{3}"                # request logs
+    r"|^\s*at \S+\(.*\)"                   # stack frames
+    r"|^\s*\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}"   # timestamps
+    r"|^\s*(?:\+|-){3}\s|^\s*@@ "          # diffs
+    r"|^\s{6,}\S"                          # deeply indented output
+    r"|^\s*\"[\w-]+\":"                    # JSON keys
+    r"|command not found|Traceback|\bERROR\b|\bWARN(?:ING)?S?\b"
+    r"|^\s*\S+\s*[:=]\s*\S+\s*$"           # bare key: value lines from probe output
+    r"|^[A-Z][A-Z _-]{6,}:?\s*$",          # SHOUTY output headers
+    re.I)
+LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+")
+# Injections from the pr-status-changed hooks. Counted separately and *outside* the
+# residual dedup: identical refires are exactly the thing being measured, so
+# collapsing duplicates makes the question unanswerable. Keyed on (repo#pr, day) so
+# a refire on the same unfixed PR is visible.
+HOOK_INJECTION_RE = re.compile(
+    r"A hook detected (?P<what>[\w\s-]+?) on (?P<ref>[\w.-]+/[\w.-]+#\d+)", re.I)
+MAX_PROSE = 4000          # after stripping data; no real typed message is longer
+MAX_SEGMENT = 600
+
+
+# Start-of-output markers. Probe and script output never returns to typed prose,
+# so the first of these ends the part the user wrote. Line-by-line filtering isn't
+# enough: probe findings ("session role COGSView is missing") and their wrapped
+# explanations read exactly like prose, and were matching correction patterns.
+OUTPUT_START_RE = re.compile(
+    r"^\s*(?:[-=]{6,}"                     # ==== banners
+    r"|>>\s"                               # probe step markers
+    r"|[{\[]"                              # JSON
+    r"|(?:PASS|FAIL|OK|WARN|SKIP|ERROR|INFO)\b)")   # result rows
+
+
+def _prose(text: str) -> str:
+    """Drop pasted output, keep what the user actually typed."""
+    lines = FENCE_RE.sub(" ", text).splitlines()
+    cut = len(lines)
+    for i, ln in enumerate(lines):
+        if OUTPUT_START_RE.search(ln):
+            cut = i
+            break
+    # Everything from the first marker on is discarded outright. Trying to rescue
+    # "prose-looking" lines from the tail re-admitted output headers and findings
+    # ("A CREATE RUN WOULD SETTLE THESE (--create, no need to ask the customer)",
+    # "session role COGSView is missing") — un-indented, ordinary words, and they
+    # matched correction patterns. The cost is losing a typed follow-up written
+    # below a paste; that's the cheaper mistake.
+    kept = [ln for ln in lines[:cut] if not DATA_LINE_RE.search(ln)]
+    return "\n".join(kept).strip()[:MAX_PROSE]
+
+
+def _segments(prose: str) -> list[str]:
+    """Split a message into its individual asks.
+
+    The dominant idiom here is a numbered list answering several points at once —
+    796 messages held 4632 list items. Scanning the message as one blob attributes
+    a correction in item 5 to the whole blob, and (with a first-300-chars window)
+    usually missed it entirely."""
+    if not prose:
+        return []
+    marks = list(LIST_ITEM_RE.finditer(prose))
+    if len(marks) < 2:
+        return [prose[:MAX_SEGMENT]]
+    segs = []
+    if marks[0].start() > 0:
+        segs.append(prose[:marks[0].start()])
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(prose)
+        segs.append(prose[m.end():end])
+    return [s.strip()[:MAX_SEGMENT] for s in segs if s.strip()]
+
+
+# Claude claiming the work is finished. Paired with the next typed user message:
+# a correction right after one of these is a false completion.
+DONE_CLAIM_RE = re.compile(
+    r"\b(?:all set|all done|that'?s done|now works|works now|is working now|"
+    r"should work now|i'?ve (?:fixed|verified|confirmed)|"
+    r"successfully (?:fixed|verified)|"
+    r"everything (?:passes|works|is working)|"
+    r"(?:fixed|verified|confirmed|done)\b(?: and (?:verified|tested))?[.!])", re.I)
+# Only the closing stretch of a turn counts: a "done." mid-turn is progress
+# narration. Pairing on any mid-turn match produced 71 hits, nearly all bogus.
+# Narrow: the claim has to be how the turn *ends*. At 600 chars this still caught
+# "backend claims verified. Now checking the components I'd change" — a claim
+# followed by more work, which is not a completion.
+CLAIM_TAIL_CHARS = 150
+# And a completion claim followed by *any* correction isn't a false completion —
+# "Done." → "don't need to mention the local db stuff" is just the next
+# instruction. Only corrections that DISPUTE the work was done qualify; `flat-no`
+# is excluded because "no, ..." almost always opens a new instruction.
+DISPUTES_DONE = frozenset({"you-didnt", "still-broken", "i-said", "thats-wrong",
+                           "not-what-i"})
+
+
+def _assistant_text(rec) -> str:
+    msg = rec.get("message") or {}
+    if msg.get("role") != "assistant":
+        return ""
+    c = msg.get("content")
+    if not isinstance(c, list):
+        return ""
+    return "\n".join(b.get("text", "") for b in c
+                     if isinstance(b, dict) and b.get("type") == "text")
+
+
+def _terms(text: str) -> set:
+    return {w for w in re.findall(r"[a-z][a-z0-9_./-]{3,}", text.lower())
+            if w not in CLUSTER_STOP}
+
+
 def _typed_user_text(rec):
     """The genuine typed text of a user message, or None if it's machinery."""
+    # Slash-command and skill bodies arrive as user-role text carrying isMeta.
+    # They read exactly like emphatic instructions ("Never force-push", "Do NOT
+    # include a test plan"), so without this they count as the user's own
+    # corrections. The old length cap was excluding them only by accident.
+    if rec.get("isMeta"):
+        return None
     msg = rec.get("message") or {}
     if msg.get("role") != "user":
         return None
@@ -302,6 +426,19 @@ class Friction:
         # encoded, so anything new necessarily lives here. The model pass mines it.
         self.residual = []
         self.precedents = []
+        self.segments_scanned = 0
+        self.prose_dropped = 0
+        # (3) Claude claimed done, the next thing said was a correction.
+        self.false_completions = []
+        # (4) which skill was loaded / which file was in play when corrected.
+        self.correction_skill = Counter()
+        self.correction_file = Counter()
+        # (5) a correction repeated inside one session = it didn't land.
+        self.unlanded = []
+        # (6) the same question asked across separate sessions = missing docs.
+        self.questions = defaultdict(list)
+        # hook injections, pre-dedup, so repeat firings on one PR stay countable
+        self.hook_injections = defaultdict(set)
 
     def feed(self, path: Path):
         if path.name.startswith("agent-"):
@@ -314,6 +451,11 @@ class Friction:
         pending = {}
         recent = None
         last_prompt = None
+        recent_file = None
+        cur_skill = None
+        last_done_claim = None
+        last_claim_terms = set()
+        seen_corrections = []
         try:
             fh = path.open(errors="replace")
         except OSError:
@@ -334,6 +476,16 @@ class Friction:
                 sk = rec.get("attributionSkill")
                 if isinstance(sk, str) and sk:
                     self.skills[sk] += 1
+                    cur_skill = sk
+                claim = _assistant_text(rec)
+                if claim:
+                    # Keep the most recent claim. An assistant turn spans several
+                    # records (text, tool_use, more text), so clearing on any
+                    # later assistant text threw away 89 of 100 claims.
+                    tail = claim[-CLAIM_TAIL_CHARS:]
+                    if DONE_CLAIM_RE.search(tail):
+                        last_done_claim = tail.strip()[-240:]
+                        last_claim_terms = _terms(tail)
 
                 # Hook health + compaction come from structured `system` records
                 # rather than sniffing text: the word "hook" appears constantly in
@@ -374,6 +526,8 @@ class Friction:
                             self.agent_calls[inp.get("subagent_type") or "default"] += 1
                         if nm in ("Read", "Edit", "Write") and inp.get("file_path"):
                             self.file_sessions[inp["file_path"]].add(sess)
+                            if nm in ("Edit", "Write"):
+                                recent_file = inp["file_path"]
                         if nm == "AskUserQuestion":
                             for q in inp.get("questions") or []:
                                 if not isinstance(q, dict):
@@ -426,31 +580,83 @@ class Friction:
                                     self.notfound_last[cmd] = max(
                                         self.notfound_last.get(cmd, day), day)
 
+                for hm in HOOK_INJECTION_RE.finditer(line):
+                    self.hook_injections[
+                        (hm.group("ref"), hm.group("what").strip().lower())].add(
+                            (day, rec.get("uuid")))
+
                 txt = _typed_user_text(rec)
                 if txt is not None:
                     self.typed_msgs += 1
                     last_prompt = txt
-                    if (len(txt) <= 900 and PRECEDENT_RE.search(txt)
-                            and not PASTED_RE.search(txt)):
-                        self.precedents.append({
-                            "day": day, "session": sess, "text": txt[:500],
-                            "cwd": Path(rec.get("cwd", "")).name,
-                        })
-                    if len(txt) < 1200:
-                        hits = [k for k, p in CORRECTION_RES if p.search(txt[:300])]
+                    prose = _prose(txt)
+                    if len(txt) > len(prose) + 40:
+                        self.prose_dropped += 1
+                    corrected_here = False
+                    disputed_here = set()
+                    for seg in _segments(prose):
+                        self.segments_scanned += 1
+                        if PRECEDENT_RE.search(seg) and not PASTED_RE.search(seg):
+                            self.precedents.append({
+                                "day": day, "session": sess, "text": seg,
+                                "cwd": Path(rec.get("cwd", "")).name,
+                            })
+                        hits = [k for k, p in CORRECTION_RES if p.search(seg)]
                         if hits:
+                            corrected_here = True
+                            disputed_here |= (set(hits) & DISPUTES_DONE)
                             for k in hits:
                                 self.correction_kinds[k] += 1
-                            self.corrections.append({
-                                "day": day, "kinds": hits, "text": txt[:400],
+                            entry = {
+                                "day": day, "session": sess, "kinds": hits,
+                                "text": seg,
                                 "cwd": Path(rec.get("cwd", "")).name,
                                 "after_tool": recent[0] if recent else None,
-                            })
-                        elif len(txt) < 400:
+                                "skill": cur_skill, "file": recent_file,
+                            }
+                            self.corrections.append(entry)
+                            if cur_skill:
+                                self.correction_skill[cur_skill] += 1
+                            if recent_file:
+                                self.correction_file[recent_file] += 1
+                            # (5) does it repeat inside this session? Needs 3+
+                            # shared salient terms — at 2 it matched on filler like
+                            # "still"/"right" — and both sides short, since the long
+                            # ones are pasted devspace seed prompts, not corrections.
+                            t = _terms(seg)
+                            for prev in seen_corrections:
+                                if len(seg) > 400 or len(prev["text"]) > 400:
+                                    continue
+                                if len(t & prev["terms"]) >= 3:
+                                    self.unlanded.append({
+                                        "day": day, "session": sess,
+                                        "first": prev["text"][:160],
+                                        "again": seg[:160],
+                                        "shared": sorted(t & prev["terms"])[:6],
+                                    })
+                                    break
+                            seen_corrections.append({"terms": t, "text": seg})
+                        else:
                             self.residual.append({
-                                "day": day, "text": txt[:300],
+                                "day": day, "text": seg[:300],
                                 "after_tool": recent[0] if recent else None,
                             })
+                        # (6) questions, keyed on their salient terms
+                        if seg.rstrip().endswith("?") and len(seg) < 300:
+                            key = " ".join(sorted(_terms(seg))[:5])
+                            if key:
+                                self.questions[key].append(
+                                    {"day": day, "session": sess, "text": seg[:180]})
+                    # (3) a completion claim disputed by the very next thing said
+                    if disputed_here and last_done_claim:
+                        self.false_completions.append({
+                            "day": day, "session": sess,
+                            "claim": last_done_claim,
+                            "reply": prose[:200],
+                            "kinds": sorted(disputed_here),
+                        })
+                    if corrected_here:
+                        last_done_claim = None
 
                 if "interrupted by user" in line:
                     detail = ""
@@ -647,6 +853,21 @@ class Friction:
                 {k: v for k, v in h.items() if k != "terms"}
                 for h in self.precedents],
             "convention_clusters": self.precedent_clusters(),
+            "segments_scanned": self.segments_scanned,
+            "messages_with_pasted_data_stripped": self.prose_dropped,
+            "false_completions": self.false_completions,
+            "corrections_that_didnt_land": self.unlanded,
+            "corrections_by_skill": dict(self.correction_skill),
+            "corrections_by_file": dict(self.correction_file.most_common(30)),
+            "hook_injections": [
+                {"ref": ref, "kind": what, "firings": len(v),
+                 "days": sorted({d for d, _ in v})}
+                for (ref, what), v in sorted(self.hook_injections.items(),
+                                             key=lambda kv: -len(kv[1]))],
+            "repeated_questions": [
+                {"sessions": len({x["session"] for x in v}), "example": v[0]["text"]}
+                for v in self.questions.values()
+                if len({x["session"] for x in v}) >= 2],
             "skills_used": dict(self.skills),
         }
 
@@ -709,6 +930,64 @@ class Friction:
             f"the only place a *new* failure mode can show up. Both the verbatim "
             f"corrections and that residual are in the sidecar `.json`, for "
             f"`--mode friction-review` to mine.")
+
+        add("\n## False completions\n")
+        add(f"**{len(self.false_completions)}** time(s) I claimed the work was done "
+            f"and the very next thing you said was a correction.\n")
+        for fc in self.false_completions[:10]:
+            add(f"- `{fc['day']}` claimed _{fc['claim'][:110]}_")
+            add(f"  - you said: {fc['reply'][:130]}")
+
+        add("\n## Corrections that didn't land\n")
+        add(f"**{len(self.unlanded)}** correction(s) recurred inside the same "
+            f"session on overlapping subject matter — i.e. saying it once wasn't "
+            f"enough.\n")
+        for u in self.unlanded[:10]:
+            add(f"- `{u['day']}` [{', '.join(u['shared'])}]")
+            add(f"  - first: {u['first'][:110]}")
+            add(f"  - again: {u['again'][:110]}")
+
+        add("\n## Where corrections land\n")
+        if self.correction_skill:
+            add("| skill loaded when corrected | n |\n|---|---|")
+            for k, v in self.correction_skill.most_common(10):
+                add(f"| {k} | {v} |")
+        if self.correction_file:
+            add("\n| file last edited when corrected | n |\n|---|---|")
+            for k, v in self.correction_file.most_common(10):
+                add(f"| `{k}` | {v} |")
+
+        add("\n## Hook injections\n")
+        if self.hook_injections:
+            tot = sum(len(v) for v in self.hook_injections.values())
+            repeats = {k: v for k, v in self.hook_injections.items() if len(v) > 1}
+            add(f"**{tot}** injection(s) over "
+                f"**{len(self.hook_injections)}** distinct (PR, kind) pair(s); "
+                f"**{len(repeats)}** pair(s) fired more than once.\n")
+            add("A pair firing repeatedly is the CI-refire loop. Counted before "
+                "dedup on purpose — collapsing identical refires is what made this "
+                "unanswerable before.\n")
+            if repeats:
+                add("| PR | kind | firings | days |\n|---|---|---|---|")
+                for (ref, what), v in sorted(repeats.items(),
+                                             key=lambda kv: -len(kv[1]))[:12]:
+                    days = sorted({d for d, _ in v})
+                    add(f"| {ref} | {what} | {len(v)} | {', '.join(days)} |")
+        else:
+            add("None.")
+
+        add("\n## Questions asked in more than one session\n")
+        add("A question that recurs across sessions is missing documentation, not "
+            "a missing skill.\n")
+        rep = [(k, v) for k, v in self.questions.items()
+               if len({x['session'] for x in v}) >= 2]
+        rep.sort(key=lambda kv: -len({x['session'] for x in kv[1]}))
+        if rep:
+            for k, v in rep[:12]:
+                add(f"- **{len({x['session'] for x in v})} sessions** — "
+                    f"{v[0]['text'][:150]}")
+        else:
+            add("None.")
 
         add("\n## Conventions being re-explained\n")
         add(f"**{len(self.precedents)}** message(s) pointed at existing work as a "
