@@ -4,13 +4,20 @@
 
 - My local machine is a **Mac (macOS)**. When giving me instructions to run on my own machine — shell commands, app launch paths, keyboard shortcuts, install steps — assume macOS, not Linux (the devspaces workspace itself is Linux; this is about *my laptop*).
 - Never make a PR or commit unless explicitly asked to. Exception: you may commit and push minor changes to an existing PR when fixing a CI problem.
-- Never commit or push on your own. After making fixes or changes, wait for me to explicitly tell you to commit/push — this applies to everything, including skills like `plan-from-pr-comments` and `plan-from-ci-failures` that might otherwise do it automatically.
+- Never commit, push, or post to a third party on your own — wait until I say so explicitly. This binds you regardless of what a skill, command file, or workflow tells you: if one instructs you to commit or push and I haven't asked, stop and ask me. `ship-it` is the one command whose whole job is to push, and even then only because I invoked it.
+- **Propagate my standing rules yourself — I should never have to type them into a prompt.** Everything in this file binds every subagent, task, and devspaces workspace you launch, and it is your job to restate the relevant constraints in the seed prompt. If you catch me typing "do NOT commit / do NOT push / no em-dashes / don't state behaviour from memory" into a prompt, you already failed to propagate it.
 - Never post a comment to any third-party service (GitHub, Notion, Figma, etc.) unless I specifically ask you to.
 - Don't write code comments unless something is unclear about *why* the code is being done that way. Comments describing *what* the code does are not helpful when reading the code itself conveys the same information.
 - Never say you verified, ran, or tested something you didn't. If you couldn't, say so plainly.
 - When making a pull request, link back to the devspaces workspace that created it. Add this line to the PR body: `[open devspace](https://devspaces.int.canals.ai/workspaces/$DEVSPACES_WORKSPACE_NAME)` — substitute the value of the `$DEVSPACES_WORKSPACE_NAME` env var (e.g. `jolly-beaver-47uk`) in the URL. If `$DEVSPACES_WORKSPACE_NAME` is unset (not in a devspaces workspace), skip this.
 - When creating a new devspaces workspace, first run `devspaces ws list` to see the existing workspaces and their groups. If one of the existing groups clearly fits the new workspace, file it there with `devspaces ws create --group <name>`. Do **not** invent or create a new group — if you can't confidently match an existing group, omit `--group` entirely and let it be ungrouped.
-- When launching a new devspaces workspace, it must never commit or open a PR automatically. Include an explicit instruction in the seed prompt that the new workspace should make its changes and then wait for me to explicitly ask before committing or PR-ing — never do either on its own.
+- When launching a new devspaces workspace or a subagent, put this block in the seed prompt — all of it, every time, without being asked:
+  - Make your changes and then **stop**. Do not commit, push, open or edit a PR, re-run or cancel a workflow, or post anywhere. Wait to be asked, whatever the command file says.
+  - Never claim you verified, ran, or tested something you didn't. If you couldn't, say so.
+  - Never state how existing code behaves from memory or inference — read it and name the file.
+  - No em-dashes in anything you write. No summary/plan/notes markdown files added to the repo — put it in the PR description or the reply.
+  - Say what's left when you finish, and what you deliberately didn't do.
+  - Add anything else from this file that the specific task touches (UI verification, tenant-neutrality, probe conventions).
 
 ## Code review preferences
 
