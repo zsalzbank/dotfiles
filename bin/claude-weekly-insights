@@ -1,0 +1,1269 @@
+#!/usr/bin/env python3
+"""Analyze one week of consolidated Claude Code sessions.
+
+The shutdown hook (`hooks/shutdown/backup-sessions.py`) copies every workspace's
+Claude transcripts into the durable share, bucketed by ISO week:
+
+    /mnt/personal/claude-sessions/<YYYY-Www>/<session-id>.jsonl
+
+This runs one or more analysis passes over a single week's folder and writes the
+output to /mnt/personal/claude-insights/. Three passes (`--mode`):
+
+  insights     Claude Code's built-in `/insights` usage report (HTML). `/insights`
+               only analyzes transcripts under its *config dir's* `projects/`
+               tree, so we stage the week into a throwaway CLAUDE_CONFIG_DIR (auth
+               here is env-based — ANTHROPIC_API_KEY — so it survives the switch),
+               run `claude -p /insights` there, and harvest usage-data/report.html.
+
+  permissions  The built-in `fewer-permission-prompts` skill, pointed at the week
+               and forced report-only: a prioritized read-only allowlist you could
+               add to `.claude/settings.json`, derived from the week's actual
+               Bash/MCP tool calls. Prints a markdown table; writes nothing.
+
+  skills       A custom pass (no built-in equivalent) that mines the week for
+               recurring, repeatable workflows and proposes new *skills* to create.
+
+  friction     A local, deterministic pass (no model, no network) that counts the
+               places the week went wrong: interrupts (and commands re-run after
+               being killed), corrective user messages, AskUserQuestion stalls and
+               how often they were rejected, refused tool calls, missing commands,
+               hook errors, context compactions, oversized tool results, files
+               re-derived across many sessions, subagent cost-vs-return, and which
+               skills actually got used. Pure stdlib and seconds to run, so unlike
+               the model-driven passes above it's cheap to run over every week.
+               Writes an alarm-first markdown report plus a `-friction.json`
+               corpus for the pass below. Read the alarms; the correction-pattern
+               profile is a stable fingerprint and says little week to week.
+
+  friction-review
+               The interpretation half, and the one worth reading weekly. Hands the
+               model the *complete* corpus above (not a ~40-file sample) plus a
+               persistent ledger of previously-reported findings, and asks only for
+               what's new: failure modes the hand-written patterns can't name (mined
+               from the unmatched messages), and corrections that violate a rule
+               already in CLAUDE.personal.md — meaning that rule needs sharpening.
+               The ledger is what stops a weekly cadence from repeating itself.
+
+The weekly loop is `--mode weekly` (friction + friction-review); the model-driven
+insights/permissions/skills passes are better run occasionally.
+
+(`/skill-doctor` — "which loaded skills are unused" — is interactive-only and
+reports on your *current* setup, not an arbitrary folder, so it isn't scriptable
+here; run it live with `claude` when you want it.)
+
+Usage:
+    claude-weekly-insights [YYYY-Www]                 # insights, last complete week
+    claude-weekly-insights 2026-W30 --mode all        # all four passes
+    claude-weekly-insights 2026-W30 --mode permissions,skills
+    claude-weekly-insights --mode weekly              # THE weekly loop
+    claude-weekly-insights 2026-W30 --mode friction   # local, no model, seconds
+    claude-weekly-insights --list                     # which weeks exist
+
+Only Python's stdlib is used, so it runs on Linux and macOS alike. In practice
+it runs inside a devspaces workspace, where the sessions share is mounted and
+`claude` is authenticated.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SESSIONS_ROOT = Path("/mnt/personal/claude-sessions")
+INSIGHTS_ROOT = Path("/mnt/personal/claude-insights")
+WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
+ALL_MODES = ("insights", "permissions", "skills", "friction", "friction-review")
+# `friction` is local Python; the others shell out to `claude`. Order matters:
+# `friction-review` consumes the corpus `friction` writes, so it must run after.
+LOCAL_MODES = ("friction",)
+WEEKLY_MODES = ("friction", "friction-review")
+
+# `fewer-permission-prompts` is a bundled skill whose prompt hardcodes
+# ~/.claude/projects as the scan root and ends by writing .claude/settings.json.
+# It takes a trailing argument that gets appended to that prompt, so we override
+# both: scan the week folder instead, and report only (write nothing).
+PERMISSIONS_OVERRIDE = (
+    "IMPORTANT OVERRIDES to the instructions above: "
+    "(1) Do NOT scan ~/.claude/projects. Instead scan ONLY the transcripts at "
+    "{week_dir}/*.jsonl. "
+    "(2) Do NOT create or modify any settings.json or any other file, and skip "
+    "the merge step entirely. Only PRINT the final prioritized markdown table of "
+    "recommended read-only permission allowlist patterns, followed by a short "
+    "'skipped and why' note, as your response."
+)
+
+SKILLS_PROMPT = """\
+# Propose Claude Code skills from a week of sessions
+
+Analyze the Claude Code session transcripts in `{week_dir}` and propose new
+*skills* worth creating — reusable, parameterized workflows that would save time
+or prevent repeated mistakes in future sessions.
+
+## Input
+Transcripts are JSONL at `{week_dir}/*.jsonl` (one session per file; `agent-*.jsonl`
+are subagent runs). Each line is a JSON object. User intent appears as `user`
+messages whose `message.content` is a string; actions appear as `assistant`
+messages with `message.content[]` entries of `type:"tool_use"` (the `name` field
+is the tool, e.g. `Bash`, `Edit`, `mcp__*`; for Bash, `input.command` is the shell
+string). Read the most-recently-modified transcripts (cap ~40 to stay fast); use
+Grep/Glob to survey before reading whole files.
+
+## What makes a good skill candidate
+- A multi-step workflow that recurred across sessions, or was repeated within one
+  (e.g. the same grep -> edit -> typecheck -> PR sequence; a specific debugging or
+  data-pull routine; a fixed release/deploy dance).
+- Work where the user re-explained the same context or steps, or corrected Claude
+  the same way more than once — the correction is the rule the skill should bake in.
+- A stable structure with varying input (a natural fit for a parameterized skill).
+
+Ignore one-offs, trivial single-command asks, and anything a single tool call
+already covers.
+
+## Output — print only; do NOT create or modify any files
+A markdown report:
+1. A ranked table: `| # | Proposed skill | Trigger | Times seen | Effort saved |`.
+2. For the top ~5, a short spec each: kebab-case name, one-line description,
+   when-to-use trigger, and the concrete steps it would encode (as they actually
+   appeared in the transcripts). Note any recurring user correction it should
+   enforce.
+3. A short "Not worth a skill" note: recurring things better handled by a
+   permission allowlist, a CLAUDE.md note, or an existing Claude Code feature.
+
+Ground every proposal in evidence from the transcripts and say which kind of
+task/session it came from. Do not invent workflows that aren't there.
+"""
+
+
+# --------------------------------------------------------------------------- #
+# friction mode
+# --------------------------------------------------------------------------- #
+
+# Corrective-language patterns, in two families. HARD is explicit negation or
+# rebuke. SOFT is interrogative pushback — which an audit of a random sample of
+# real messages showed is the dominant idiom ("didn't we do that in g1?",
+# "i thought we filter those out", "- no?"). HARD alone undercounts by ~3x.
+# Precision spot-checked at roughly 85%; treat counts as a trend, not a ledger.
+CORRECTION_PATS = (
+    ("flat-no",       r"^\s*(no|nope|nah)\b[\s,.!]*"),
+    ("dont",          r"^\s*(don'?t|do not|stop|never)\b"),
+    ("actually",      r"^\s*actually\b"),
+    ("i-said",        r"\bi (?:already )?(?:said|told you|asked)\b"),
+    ("revert-undo",   r"\b(revert|undo|roll ?back|put it back)\b"),
+    ("thats-wrong",   r"\b(that'?s|this is) (?:wrong|not right|incorrect|not what)\b"),
+    ("you-didnt",     r"\byou (?:didn'?t|did not|never)\b"),
+    ("not-what-i",    r"\bnot what i\b"),
+    ("dont-need",     r"\b(don'?t need|no need|not needed|unnecessary)\b"),
+    ("wrong-place",   r"\bwrong (?:file|place|repo|branch|directory)\b"),
+    ("still-broken",  r"\bstill (?:look|looks|doesn'?t|does not|not |broken|failing"
+                      r"|wrong|there|showing|happening)\b"),
+    ("socratic-neg",  r"^\s*(?:but\s+)?(didn'?t|don'?t|doesn'?t|isn'?t|aren'?t|"
+                      r"shouldn'?t|couldn'?t|wouldn'?t|can'?t|won'?t|wasn'?t)\b"),
+    ("tag-question",  r"[-—,]\s*(no|right|correct)\?\s*$|\b(right|no)\?\s*$"),
+    ("i-thought",     r"\bi thought\b"),
+    ("why-choice",    r"\bwhy (?:did|are|do|does|would|is|not)\b"),
+    ("can-we-just",   r"\b(?:can|could|should) (?:we|you|it|this|that) (?:just|really)\b"),
+    ("remove-ask",    r"\b(?:can|could|should)(?: it| this| that| we| you)?\b[^.?!]{0,30}"
+                      r"\b(?:be )?(?:remov|delet|drop)"),
+    ("shouldnt-we",   r"\bshould(?:n'?t)? (?:we|this|it|there)\b"),
+)
+CORRECTION_RES = tuple((k, re.compile(p, re.I)) for k, p in CORRECTION_PATS)
+
+# Convention re-explanation. Corrections are only half the friction signal: the
+# other half is being pointed at existing work as a template for a recurring task
+# ("make a probe like the others"), which never reads as a correction and so is
+# invisible to the patterns above. Each cluster of these is a skill that doesn't
+# exist yet — it's how the ERP-probe conventions were found.
+PRECEDENT_RE = re.compile(
+    r"\blike (?:the |we |what |our |my )?(?:others?|existing|before|we (?:did|do|have)|"
+    r"in the|that one)\b"
+    r"|\b(?:follow|following|mirror|copy) (?:the )?(?:existing|same|shape|pattern|convention)"
+    r"|\bas a (?:base|template|starting point|reference)\b"
+    r"|\bsee (?:the )?(?:example|existing)\b"
+    r"|\b(?:same|similar) (?:as|to) (?:the )?(?:others?|existing|what)\b"
+    r"|\blike (?:we|i) (?:already )?(?:have|did|do)\b"
+    r"|\bexample (?:probe|script|file|doc)s?\b"
+    r"|\b(?:the )?way we (?:do|did) (?:it|this)\b", re.I)
+# Pasted tool/API output rather than a typed instruction.
+PASTED_RE = re.compile(r"HTTP \d{3}|={20,}|\"rows\"|Minting token", re.M)
+CLUSTER_STOP = frozenset("""the a an and or but if then this that these those it its is are
+was were be been being to of in on at by for with from as into about after before over under
+again further once here there when where why how all any both each few more most other some
+such no nor not only own same so than too very can will just don dont should now we i you our
+your me my lets let make made give given need needs needed want wants use used using do does
+did doing have has had get got go goes going see look looks like also they them their what
+which who whom whose one two new old first last next thing things stuff way ways run runs
+running yes yeah ok okay please thanks sure fine good great could would there's""".split())
+
+# Anything matching these is machinery, not something the user typed.
+SYNTHETIC_RE = re.compile(
+    r"<system-reminder>|<local-command-|<command-name>|<command-message>|"
+    r"Caveat: The messages below|<user-prompt-submit-hook>|<task-notification>|"
+    r"^\s*\[Request interrupted|<bash-input>|<bash-stdout>", re.I)
+REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+# Real output is "/bin/bash: line 1: bc: command not found" — don't anchor.
+NOT_FOUND_RE = re.compile(r"([\w.\-/]+): command not found")
+DENIED_RE = re.compile(
+    r"The user doesn't want to (?:proceed with this tool use|take this action)"
+    r"|tool use was rejected|User rejected", re.I)
+# Tools whose results are file/search content — excluded from text-sniffing so a
+# planning doc that merely says "blocked by" isn't counted as a real event.
+CONTENT_TOOLS = {"Read", "Grep", "Glob", "NotebookRead"}
+FAT_RESULT_BYTES = 20_000
+
+
+def _ts(rec):
+    t = rec.get("timestamp")
+    if not isinstance(t, str):
+        return None
+    try:
+        return datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _blocks(rec):
+    c = (rec.get("message") or {}).get("content")
+    return c if isinstance(c, list) else []
+
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(x.get("text", "") for x in content
+                         if isinstance(x, dict) and isinstance(x.get("text"), str))
+    return "" if content is None else json.dumps(content)
+
+
+def _typed_user_text(rec):
+    """The genuine typed text of a user message, or None if it's machinery."""
+    msg = rec.get("message") or {}
+    if msg.get("role") != "user":
+        return None
+    c = msg.get("content")
+    if isinstance(c, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+            return None
+        c = _text_of(c)
+    if not isinstance(c, str) or not c.strip():
+        return None
+    stripped = REMINDER_RE.sub("", c).strip()
+    if not stripped or SYNTHETIC_RE.search(stripped[:400]):
+        return None
+    return stripped
+
+
+class Friction:
+    """One streaming pass over a week's transcripts, collecting friction signals."""
+
+    def __init__(self):
+        self.sessions = set()
+        self.days = Counter()
+        self.typed_msgs = 0
+        self.interrupts = []
+        self.corrections = []
+        self.correction_kinds = Counter()
+        self.asks = []
+        self.ask_headers = Counter()
+        self.ask_killed = 0
+        self.denials = []
+        self.denied_tools = Counter()
+        self.notfound = Counter()
+        self.notfound_where = defaultdict(Counter)
+        self.notfound_last = {}
+        self.hook_cmds = Counter()
+        self.hook_ms = defaultdict(int)
+        self.hook_last = {}
+        self.hook_errors = []
+        self.hook_prevented = 0
+        self.ask_killed_last = None
+        self.compactions = []
+        self.fat = Counter()
+        self.fat_bytes = Counter()
+        self.result_bytes = Counter()
+        self.file_sessions = defaultdict(set)
+        self.agent_calls = Counter()
+        self.agent_returned = 0
+        self.agent_empty = 0
+        self.sub_files = 0
+        self.sub_bytes = 0
+        self.skills = Counter()
+        # Short typed messages that matched NO correction pattern. This is the
+        # discovery channel: the regexes can only find failure modes already
+        # encoded, so anything new necessarily lives here. The model pass mines it.
+        self.residual = []
+        self.precedents = []
+
+    def feed(self, path: Path):
+        if path.name.startswith("agent-"):
+            self.sub_files += 1
+            try:
+                self.sub_bytes += path.stat().st_size
+            except OSError:
+                pass
+        sess = path.stem
+        pending = {}
+        recent = None
+        last_prompt = None
+        try:
+            fh = path.open(errors="replace")
+        except OSError:
+            return
+        with fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                self.sessions.add(sess)
+                t = _ts(rec)
+                day = t.date().isoformat() if t else "?"
+                if t:
+                    self.days[day] += 1
+                sk = rec.get("attributionSkill")
+                if isinstance(sk, str) and sk:
+                    self.skills[sk] += 1
+
+                # Hook health + compaction come from structured `system` records
+                # rather than sniffing text: the word "hook" appears constantly in
+                # this codebase's own source and docs, so text matching is useless.
+                if rec.get("type") == "system":
+                    sub = rec.get("subtype")
+                    if sub == "stop_hook_summary":
+                        for hi in rec.get("hookInfos") or []:
+                            if isinstance(hi, dict) and hi.get("command"):
+                                cmd = hi["command"]
+                                self.hook_cmds[cmd] += 1
+                                self.hook_ms[cmd] += hi.get("durationMs") or 0
+                                if day != "?":
+                                    self.hook_last[cmd] = max(
+                                        self.hook_last.get(cmd, day), day)
+                        for err in rec.get("hookErrors") or []:
+                            self.hook_errors.append({"day": day,
+                                                     "error": str(err)[:200]})
+                        if rec.get("preventedContinuation"):
+                            self.hook_prevented += 1
+                    elif sub == "compact_boundary":
+                        meta = rec.get("compactMetadata") or {}
+                        self.compactions.append({
+                            "day": day,
+                            "trigger": meta.get("trigger", "?"),
+                            "pre_tokens": meta.get("preTokens") or 0,
+                        })
+
+                for b in _blocks(rec):
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use":
+                        nm = b.get("name", "?")
+                        inp = b.get("input") or {}
+                        pending[b.get("id")] = (nm, inp)
+                        recent = (nm, inp)
+                        if nm == "Agent":
+                            self.agent_calls[inp.get("subagent_type") or "default"] += 1
+                        if nm in ("Read", "Edit", "Write") and inp.get("file_path"):
+                            self.file_sessions[inp["file_path"]].add(sess)
+                        if nm == "AskUserQuestion":
+                            for q in inp.get("questions") or []:
+                                if not isinstance(q, dict):
+                                    continue
+                                hdr = q.get("header") or "?"
+                                self.ask_headers[hdr] += 1
+                                self.asks.append({
+                                    "day": day, "header": hdr,
+                                    "question": (q.get("question") or "")[:300],
+                                    "options": [o.get("label")
+                                                for o in (q.get("options") or [])
+                                                if isinstance(o, dict)][:4],
+                                })
+                    elif b.get("type") == "tool_result":
+                        nm, inp = pending.get(b.get("tool_use_id"), ("?", {}))
+                        s = _text_of(b.get("content"))
+                        n = len(s)
+                        self.result_bytes[nm] += n
+                        if n > FAT_RESULT_BYTES:
+                            self.fat[nm] += 1
+                            self.fat_bytes[nm] += n
+                        if nm == "Agent":
+                            self.agent_returned += n
+                            if n == 0:
+                                self.agent_empty += 1
+                        if nm in CONTENT_TOOLS:
+                            continue          # file content: never a real event
+                        if DENIED_RE.search(s[:800]):
+                            self.denied_tools[nm] += 1
+                            if nm == "AskUserQuestion":
+                                self.ask_killed += 1
+                                if day != "?":
+                                    self.ask_killed_last = max(
+                                        self.ask_killed_last or day, day)
+                            self.denials.append({
+                                "day": day, "tool": nm,
+                                "detail": str(inp.get("command")
+                                              or inp.get("file_path")
+                                              or json.dumps(inp))[:200],
+                            })
+                        # One event per result: a poll loop re-emits the same
+                        # error every iteration (3 real `bc` calls once produced
+                        # 45+ textual matches).
+                        for cmd in set(NOT_FOUND_RE.findall(s)):
+                            if len(cmd) < 40:
+                                self.notfound[cmd] += 1
+                                self.notfound_where[cmd][
+                                    Path(rec.get("cwd", "")).name] += 1
+                                if day != "?":
+                                    self.notfound_last[cmd] = max(
+                                        self.notfound_last.get(cmd, day), day)
+
+                txt = _typed_user_text(rec)
+                if txt is not None:
+                    self.typed_msgs += 1
+                    last_prompt = txt
+                    if (len(txt) <= 900 and PRECEDENT_RE.search(txt)
+                            and not PASTED_RE.search(txt)):
+                        self.precedents.append({
+                            "day": day, "session": sess, "text": txt[:500],
+                            "cwd": Path(rec.get("cwd", "")).name,
+                        })
+                    if len(txt) < 1200:
+                        hits = [k for k, p in CORRECTION_RES if p.search(txt[:300])]
+                        if hits:
+                            for k in hits:
+                                self.correction_kinds[k] += 1
+                            self.corrections.append({
+                                "day": day, "kinds": hits, "text": txt[:400],
+                                "cwd": Path(rec.get("cwd", "")).name,
+                                "after_tool": recent[0] if recent else None,
+                            })
+                        elif len(txt) < 400:
+                            self.residual.append({
+                                "day": day, "text": txt[:300],
+                                "after_tool": recent[0] if recent else None,
+                            })
+
+                if "interrupted by user" in line:
+                    detail = ""
+                    if recent:
+                        detail = str(recent[1].get("command")
+                                     or recent[1].get("file_path")
+                                     or json.dumps(recent[1]))[:200]
+                    self.interrupts.append({
+                        "day": day, "session": sess,
+                        "tool": recent[0] if recent else None,
+                        "detail": detail,
+                        "prompt": (last_prompt or "")[:200],
+                    })
+
+    # -- reporting ---------------------------------------------------------- #
+
+    def rerun_after_kill(self):
+        """Interrupts where the SAME command in the SAME session was killed more
+        than once — i.e. it was re-run verbatim after the user stopped it."""
+        seen = defaultdict(list)
+        for i in self.interrupts:
+            if i["detail"]:
+                seen[(i["session"], i["detail"][:80])].append(i["day"])
+        return {k: v for k, v in seen.items() if len(v) > 1}
+
+    def recent_cutoff(self, tail_days: int = 7) -> str:
+        """Start of the last `tail_days` of data actually present. Used to tell a
+        live problem from one that a fix already closed out earlier in the span."""
+        if not self.days:
+            return "0000-00-00"
+        last = max(self.days)
+        try:
+            d = datetime.fromisoformat(last).date() - timedelta(days=tail_days)
+            return d.isoformat()
+        except ValueError:
+            return last
+
+    def alarms(self) -> list[str]:
+        """Counters worth acting on at a *level*, independent of trend.
+
+        Every alarm is date-gated against the last week of available data. A
+        date-blind alarm re-reports finished problems as urgent: the six commands
+        PR #4019 installed stopped recurring on its merge date but kept alarming
+        for three weeks, and a stop hook that had not fired in a fortnight was
+        still being reported as costing 10s on every turn.
+
+        The correction-pattern profile is deliberately excluded — it's a stable
+        fingerprint week to week, so its level says nothing actionable."""
+        cutoff = self.recent_cutoff()
+        live, stale = [], []
+
+        def add(text: str, last: str | None):
+            if last and last < cutoff:
+                stale.append(f"{text} last seen {last}")
+            else:
+                live.append(text + (f" Through {last}." if last else ""))
+
+        reruns = self.rerun_after_kill()
+        if reruns:
+            n = sum(len(v) for v in reruns.values())
+            last = max(d for v in reruns.values() for d in v)
+            add(f"**{n}** interrupted command(s) were re-run verbatim — should be 0.",
+                last)
+        if self.compactions:
+            worst = max(c["pre_tokens"] for c in self.compactions)
+            days = [c["day"] for c in self.compactions if c["day"] != "?"]
+            add(f"**{len(self.compactions)}** context compaction(s), worst at "
+                f"{worst:,} tokens — sessions outgrowing the window.",
+                max(days) if days else None)
+        for cmd, fires in self.hook_cmds.items():
+            avg = self.hook_ms[cmd] // max(fires, 1)
+            if avg > 500:
+                add(f"Hook `{cmd[:60]}` averages **{avg}ms** over {fires} fires "
+                    f"— it's on every turn.", self.hook_last.get(cmd))
+        if self.notfound:
+            for c, _ in self.notfound.most_common():
+                add(f"Missing command `{c}`"
+                    f" ({self.notfound[c]} call(s)).", self.notfound_last.get(c))
+        if self.asks:
+            rate = 100 * self.ask_killed // len(self.asks)
+            if rate >= 15:
+                add(f"**{rate}%** of AskUserQuestion calls were rejected "
+                    f"({self.ask_killed}/{len(self.asks)}) — asking wrongly.",
+                    self.ask_killed_last)
+        if self.agent_empty:
+            add(f"**{self.agent_empty}** subagent call(s) returned nothing.", None)
+        if self.hook_errors:
+            days = [e["day"] for e in self.hook_errors if e["day"] != "?"]
+            add(f"**{len(self.hook_errors)}** stop-hook error(s).",
+                max(days) if days else None)
+        if self.hook_prevented:
+            add(f"**{self.hook_prevented}** continuation(s) blocked by a hook.", None)
+
+        out = list(live)
+        if stale:
+            out.append(f"(Quiet since before {cutoff}, so probably already fixed — "
+                       f"{len(stale)}: " + "; ".join(stale) + ".)")
+        return out
+
+    def residual_sample(self, cap: int = 800) -> list[dict]:
+        """Dedupe the residual, then sample evenly across days.
+
+        A head-slice of file-order records silently drops whole weeks: at cap 600
+        over a 4-week span it once kept nothing after day 5, so the one channel
+        meant to surface *new* failure modes saw only the oldest week. Duplicates
+        made it worse — 110 of those 600 slots were repeats of two boilerplate
+        strings."""
+        seen, uniq = set(), []
+        for r in self.residual:
+            key = re.sub(r"\s+", " ", r["text"].strip().lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
+        if len(uniq) <= cap:
+            return uniq
+        by_day = defaultdict(list)
+        for r in uniq:
+            by_day[r["day"]].append(r)
+        days = sorted(by_day)
+        out, depth = [], 0
+        while len(out) < cap:
+            progressed = False
+            for d in days:
+                if depth < len(by_day[d]):
+                    out.append(by_day[d][depth])
+                    progressed = True
+                    if len(out) >= cap:
+                        break
+            if not progressed:
+                break
+            depth += 1
+        return out
+
+    def precedent_clusters(self, min_msgs: int = 3, min_days: int = 3):
+        """Group convention re-explanations by shared salient term.
+
+        A term recurring across several *distinct days and sessions* means the same
+        convention is being re-explained from scratch each time — i.e. it isn't
+        written down anywhere. Each row is a skill candidate."""
+        for h in self.precedents:
+            h["terms"] = {w for w in re.findall(r"[a-z][a-z0-9_./-]{3,}",
+                                                h["text"].lower())
+                          if w not in CLUSTER_STOP}
+        counts = Counter()
+        for h in self.precedents:
+            counts.update(h["terms"])
+        rows = []
+        for term, _ in counts.most_common(80):
+            ms = [h for h in self.precedents if term in h["terms"]]
+            days = {h["day"] for h in ms if h["day"] != "?"}
+            sess = {h["session"] for h in ms}
+            if len(ms) >= min_msgs and len(days) >= min_days:
+                rows.append({"term": term, "msgs": len(ms),
+                             "days": len(days), "sessions": len(sess)})
+        rows.sort(key=lambda r: (-r["days"], -r["msgs"]))
+        return rows
+
+    def corpus(self, week: str, n_files: int) -> dict:
+        """Machine-readable corpus for the model pass. The correction / interrupt /
+        ask / denial lists are complete; the residual is deduped and sampled evenly
+        across days, with both totals reported so the reader can calibrate."""
+        residual = self.residual_sample()
+        return {
+            "week": week,
+            "transcripts": n_files,
+            "interactive_sessions": len(self.sessions) - self.sub_files,
+            "typed_messages": self.typed_msgs,
+            "counters": {
+                "interrupts": len(self.interrupts),
+                "reruns_after_kill": sum(len(v)
+                                         for v in self.rerun_after_kill().values()),
+                "corrections": len(self.corrections),
+                "correction_kinds": dict(self.correction_kinds),
+                "asks": len(self.asks),
+                "asks_rejected": self.ask_killed,
+                "denials": sum(self.denied_tools.values()),
+                "missing_commands": dict(self.notfound),
+                "compactions": len(self.compactions),
+                "oversized_results": sum(self.fat.values()),
+                "agent_calls": sum(self.agent_calls.values()),
+                "subagent_mb_in": round(self.sub_bytes / 1e6, 2),
+                "subagent_mb_out": round(self.agent_returned / 1e6, 3),
+            },
+            "alarms": self.alarms(),
+            "corrections_verbatim": self.corrections,
+            "interrupts_detail": self.interrupts,
+            "asks_detail": self.asks,
+            "denials_detail": self.denials,
+            "unmatched_total": len(self.residual),
+            "unmatched_distinct_sampled": len(residual),
+            "unmatched_messages": residual,
+            "convention_reexplained": [
+                {k: v for k, v in h.items() if k != "terms"}
+                for h in self.precedents],
+            "convention_clusters": self.precedent_clusters(),
+            "skills_used": dict(self.skills),
+        }
+
+    def report(self, week: str, n_files: int) -> str:
+        out = []
+        add = out.append
+        span = f"{min(self.days)} .. {max(self.days)}" if self.days else "n/a"
+        add(f"# {week} — friction\n")
+        add("_Generated by claude-weekly-insights (local pass, no model)._\n")
+        add(f"Transcripts: **{n_files}** ({self.sub_files} subagent) · "
+            f"sessions: **{len(self.sessions)}** · typed user messages: "
+            f"**{self.typed_msgs}** · records dated {span}\n")
+        add("> Bucketing is by folder, and a session backed up in this week can "
+            "contain records from an earlier one — hence the date span above.\n")
+        add("> Rates are only comparable across weeks once divided by interactive "
+            "session count — raw totals track how much got captured, not how much "
+            "went wrong.\n")
+
+        alarms = self.alarms()
+        add("\n## Alarms\n")
+        if alarms:
+            for a in alarms:
+                add(f"- {a}")
+        else:
+            add("Nothing to report.")
+        add("\nEverything below is context, not a call to action. The "
+            "correction-pattern profile in particular is a stable fingerprint — "
+            "read it when changing your rules, not weekly.\n")
+
+        reruns = self.rerun_after_kill()
+        add("\n## Interrupts\n")
+        add(f"**{len(self.interrupts)}** interrupts. "
+            f"Re-runs of an already-killed command: "
+            f"**{sum(len(v) for v in reruns.values())}**.\n")
+        if self.interrupts:
+            add("| what was cut off | n |\n|---|---|")
+            for k, v in Counter(i["tool"] or "?" for i in self.interrupts).most_common(8):
+                add(f"| {k} | {v} |")
+        if reruns:
+            add("\n**Same command killed more than once in one session** — the "
+                "single most avoidable pattern here:\n")
+            for (sess, cmd), days in sorted(reruns.items(), key=lambda x: -len(x[1])):
+                add(f"- {len(days)}x `{sess[:8]}` {sorted(set(days))} — "
+                    f"`{cmd[:100]}`")
+
+        add("\n## Corrective user messages\n")
+        pct = 100 * len(self.corrections) // max(self.typed_msgs, 1)
+        add(f"**{len(self.corrections)}** of {self.typed_msgs} typed messages "
+            f"({pct}%) read as a correction.\n")
+        if self.correction_kinds:
+            add("| pattern | n |\n|---|---|")
+            for k, v in self.correction_kinds.most_common(20):
+                add(f"| {k} | {v} |")
+            add("\nWhat had just run when corrected:\n")
+            add("| preceding tool | n |\n|---|---|")
+            for k, v in Counter(c["after_tool"] or "?"
+                                for c in self.corrections).most_common(8):
+                add(f"| {k} | {v} |")
+        add(f"\n{len(self.residual)} short message(s) matched no known pattern — "
+            f"the only place a *new* failure mode can show up. Both the verbatim "
+            f"corrections and that residual are in the sidecar `.json`, for "
+            f"`--mode friction-review` to mine.")
+
+        add("\n## Conventions being re-explained\n")
+        add(f"**{len(self.precedents)}** message(s) pointed at existing work as a "
+            f"template (\"like the others\", \"follow the existing\", \"see "
+            f"example\"). Each cluster below is a convention that isn't written "
+            f"down anywhere — i.e. a missing skill.\n")
+        clusters = self.precedent_clusters()
+        if clusters:
+            add("| term | msgs | days | sessions |\n|---|---|---|---|")
+            for c in clusters[:15]:
+                add(f"| `{c['term']}` | {c['msgs']} | {c['days']} | {c['sessions']} |")
+        for h in sorted(self.precedents, key=lambda x: x["day"], reverse=True)[:15]:
+            add(f"- `{h['day']}` {re.sub(r'[ \t]+', ' ', h['text'])[:190]}")
+
+        add("\n## AskUserQuestion — where Claude stalled\n")
+        add(f"**{len(self.asks)}** questions; **{self.ask_killed}** rejected "
+            f"outright.\n")
+        if self.ask_headers:
+            add("| header | n |\n|---|---|")
+            for k, v in self.ask_headers.most_common(15):
+                add(f"| {k} | {v} |")
+
+        add("\n## Rejected tool calls\n")
+        add(f"**{sum(self.denied_tools.values())}** rejections.\n")
+        if self.denied_tools:
+            add("| tool | n |\n|---|---|")
+            for k, v in self.denied_tools.most_common(10):
+                add(f"| {k} | {v} |")
+
+        add("\n## Missing commands\n")
+        if self.notfound:
+            add("| command | calls | repos |\n|---|---|---|")
+            for k, v in self.notfound.most_common(20):
+                where = ", ".join(f"{r}:{n}"
+                                  for r, n in self.notfound_where[k].most_common(3))
+                add(f"| `{k}` | {v} | {where} |")
+        else:
+            add("None.")
+
+        add("\n## Hooks\n")
+        add(f"Stop-hook errors: **{len(self.hook_errors)}** · "
+            f"continuations prevented: **{self.hook_prevented}**\n")
+        if self.hook_cmds:
+            add("| hook | fires | total ms | avg ms |\n|---|---|---|---|")
+            for k, v in self.hook_cmds.most_common(10):
+                add(f"| `{k[:60]}` | {v} | {self.hook_ms[k]} | "
+                    f"{self.hook_ms[k] // max(v, 1)} |")
+        for e in self.hook_errors[:10]:
+            add(f"- `{e['day']}` {e['error']}")
+
+        add("\n## Context compactions\n")
+        if self.compactions:
+            add(f"**{len(self.compactions)}** compaction(s) — each one is a "
+                f"session that outgrew its window.\n")
+            add("| day | trigger | tokens before |\n|---|---|---|")
+            for c in self.compactions[:15]:
+                add(f"| {c['day']} | {c['trigger']} | {c['pre_tokens']:,} |")
+        else:
+            add("None.")
+
+        add("\n## Oversized tool results\n")
+        total_mb = sum(self.result_bytes.values()) / 1e6
+        add(f"Total tool-result volume **{total_mb:.0f} MB**; over "
+            f"{FAT_RESULT_BYTES // 1000}KB: **{sum(self.fat.values())}**\n")
+        if self.fat:
+            add("| tool | oversized | MB in those | total MB |\n|---|---|---|---|")
+            for k, v in self.fat.most_common(10):
+                add(f"| {k} | {v} | {self.fat_bytes[k] / 1e6:.1f} | "
+                    f"{self.result_bytes[k] / 1e6:.1f} |")
+
+        add("\n## Files re-derived across sessions\n")
+        add("Touched in many *distinct* sessions — candidates for a CLAUDE.md "
+            "pointer so they aren't rediscovered each time.\n")
+        rows = sorted(self.file_sessions.items(), key=lambda x: -len(x[1]))
+        add("| sessions | file |\n|---|---|")
+        for p, s in rows[:20]:
+            if len(s) < 3:
+                break
+            add(f"| {len(s)} | `{p}` |")
+
+        add("\n## Subagents — cost vs return\n")
+        calls = sum(self.agent_calls.values())
+        ratio = (self.sub_bytes / self.agent_returned) if self.agent_returned else 0
+        add(f"`Agent` calls **{calls}** · subagent transcripts **{self.sub_files}** "
+            f"consuming **{self.sub_bytes / 1e6:.0f} MB** to return "
+            f"**{self.agent_returned / 1e6:.2f} MB** "
+            f"(**{ratio:.0f}x** read/return ratio) · empty returns "
+            f"**{self.agent_empty}**\n")
+        if self.agent_calls:
+            add("| subagent_type | n |\n|---|---|")
+            for k, v in self.agent_calls.most_common(10):
+                add(f"| {k} | {v} |")
+
+        add("\n## Skill usage\n")
+        if self.skills:
+            add("| skill | records |\n|---|---|")
+            for k, v in self.skills.most_common(25):
+                add(f"| {k} | {v} |")
+            add("\nCompare against installed skills to find dead weight: "
+                "`claude plugin list`.")
+        else:
+            add("No `attributionSkill` records.")
+
+        return "\n".join(out) + "\n"
+
+
+LEDGER_NAME = "friction-ledger.md"
+
+FRICTION_REVIEW_PROMPT = """\
+# Weekly friction review
+
+Read the pre-extracted corpus at `{corpus}` (JSON), a distillation of my Claude
+Code sessions for this span. `corrections_verbatim`, `interrupts_detail`,
+`asks_detail` and `denials_detail` are **complete** — every instance, not a sample.
+`unmatched_messages` (short messages matching none of the known correction
+patterns) is deduped and sampled evenly across days; `unmatched_total` and
+`unmatched_distinct_sampled` tell you how much was kept, so calibrate any
+argument-from-absence against those two numbers and the per-day spread.
+
+Also read the ledger at `{ledger}` (may not exist yet). It lists findings already
+reported in previous weeks.
+
+## Your job
+
+Tell me what is **new or changed** this week. Do not re-report anything already in
+the ledger, and do not restate the counters — I can read those.
+
+The `correction_kinds` histogram is a stable fingerprint week to week; its shape is
+not a finding. What *is* a finding:
+
+1. **New failure modes** — mine `unmatched_messages` and `corrections_verbatim` for
+   recurring things the known patterns don't name. This is the main event: the
+   pattern list can only match what someone already thought of, so anything
+   genuinely new is in there. Quote the messages.
+2. **Violations of rules I already have.** Read my instruction files
+   (`/mnt/personal/CLAUDE.personal.md`, and `/etc/claude-code/CLAUDE.md` if
+   readable). Where did I correct something a rule *already* covers? That means the
+   rule is worded badly or is being ignored — say which rule, and how to sharpen it.
+3. **Ledger items that look fixed** — a previously reported pattern with no
+   instances this week. Name it so I can close it out.
+4. **Missing skills.** `convention_reexplained` / `convention_clusters` hold the
+   messages where I pointed at existing work as a template rather than a
+   convention being written down. For any cluster spanning 3+ separate sessions,
+   propose a *skill*: read the actual artefacts it references, extract the real
+   conventions (don't paraphrase my messages — go look at the files), and say what
+   the skill's trigger and non-negotiables would be. This is the highest-value
+   section; a correction costs me one comment, an unwritten convention costs me
+   the same explanation every session.
+5. **Anything in `alarms`** that needs a concrete fix, with the fix.
+
+## Output — print only; create/modify no files
+
+1. `## New this week` — findings not in the ledger, each with verbatim evidence and
+   a count. If there are none, say so plainly in one line; do not pad.
+2. `## Rules being violated` — existing rule → the correction that shows it failing
+   → a proposed rewording. Only where you have evidence.
+3. `## Looks fixed` — ledger items with no instances this week.
+4. `## Ledger additions` — a markdown list of one-line entries for the findings in
+   section 1, formatted exactly `- {week} — <slug>: <one-line description>`. I will
+   append these myself.
+
+Be blunt about weak evidence: mark anything resting on fewer than 3 instances as
+`(weak, n=N)`. A short report is a good report — most weeks should be short.
+"""
+
+
+def run_friction(week: str, transcripts: list[Path], out_dir: Path,
+                 open_report: bool, dry_run: bool) -> tuple[int, Path | None]:
+    """Local deterministic pass — no model, no network, seconds to run.
+    `week` may be a span label (`2026-W32..2026-W35`) when aggregating."""
+    if dry_run:
+        print(f"[friction] would scan {len(transcripts)} transcript(s) locally "
+              f"and write {out_dir / f'{week}-friction.md'}")
+        return 0, None
+
+    print(f"[friction] scanning {len(transcripts)} transcript(s) locally...")
+    mine = Friction()
+    for t in transcripts:
+        mine.feed(t)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / f"{week}-friction.md"
+    dest.write_text(mine.report(week, len(transcripts)))
+    corpus = out_dir / f"{week}-friction.json"
+    corpus.write_text(json.dumps(mine.corpus(week, len(transcripts)), indent=1))
+    print(f"[friction] report: {dest}")
+    print(f"[friction] corpus: {corpus}")
+    alarms = mine.alarms()
+    print(f"[friction] alarms: {len(alarms)}" + ("" if alarms else " (nothing to report)"))
+    for a in alarms:
+        print("  ! " + re.sub(r"\*\*(.+?)\*\*", r"\1", a))
+    print(f"[friction] interrupts={len(mine.interrupts)} "
+          f"(re-runs={sum(len(v) for v in mine.rerun_after_kill().values())}) "
+          f"corrections={len(mine.corrections)} asks={len(mine.asks)} "
+          f"(rejected={mine.ask_killed}) denials={sum(mine.denied_tools.values())} "
+          f"missing_cmds={sum(mine.notfound.values())} "
+          f"compactions={len(mine.compactions)}")
+    if open_report:
+        open_file(dest)
+    return 0, dest
+
+
+def run_friction_review(claude: str, week: str, transcripts: list[Path],
+                        out_dir: Path, model: str | None,
+                        open_report: bool, dry_run: bool) -> tuple[int, Path | None]:
+    """Model pass over the deterministic corpus. Cheap extraction, expensive
+    interpretation — and it sees the *whole* week rather than a sample of files.
+    The ledger is what keeps a weekly cadence from repeating itself."""
+    corpus = out_dir / f"{week}-friction.json"
+    ledger = out_dir / LEDGER_NAME
+    prompt = FRICTION_REVIEW_PROMPT.format(corpus=corpus, ledger=ledger, week=week)
+
+    if dry_run:
+        print(f"[friction-review] would ensure {corpus} exists, then run claude -p "
+              f"over it (+ ledger {ledger})")
+        return 0, None
+
+    if not corpus.is_file():
+        print("[friction-review] corpus missing — running the local pass first")
+        rc, _ = run_friction(week, transcripts, out_dir, False, False)
+        if rc or not corpus.is_file():
+            print("[friction-review] could not build corpus", file=sys.stderr)
+            return 1, None
+
+    add_dirs = ["--add-dir", str(out_dir)]
+    cmd = [claude, "-p", prompt, *add_dirs, "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+
+    sandbox = Path(tempfile.mkdtemp(prefix=f"friction-review-{week}-"))
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": str(sandbox / "cfg")}
+    print("[friction-review] interpreting the corpus with the model...")
+    rc, dest = 1, None
+    try:
+        proc = subprocess.run(cmd, cwd=sandbox, env=env, timeout=1800,
+                              capture_output=True, text=True)
+        body = (proc.stdout or "").strip()
+        if body:
+            dest = out_dir / f"{week}-friction-review.md"
+            dest.write_text(f"# {week} — friction review\n\n"
+                            "_Generated by claude-weekly-insights._\n\n" + body + "\n")
+            rc = 0
+            print(f"[friction-review] report: {dest}")
+            print("[friction-review] paste the 'Ledger additions' block into "
+                  f"{ledger} once you've acted on them")
+            if open_report:
+                open_file(dest)
+        else:
+            print("[friction-review] empty output; stderr tail:", file=sys.stderr)
+            print("\n".join((proc.stderr or "").splitlines()[-10:]), file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print("[friction-review] timed out after 30m", file=sys.stderr)
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+    return rc, dest
+
+
+# --------------------------------------------------------------------------- #
+
+
+def week_of(dt: datetime) -> str:
+    """ISO year-week label for a datetime — e.g. `2026-W30`. Matches the hook."""
+    iso = dt.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def default_week() -> str:
+    """The most recent *complete* ISO week (last week), in UTC like the hook."""
+    return week_of(datetime.now(timezone.utc) - timedelta(days=7))
+
+
+def available_weeks() -> list[str]:
+    if not SESSIONS_ROOT.is_dir():
+        return []
+    return sorted(
+        p.name for p in SESSIONS_ROOT.iterdir() if p.is_dir() and WEEK_RE.match(p.name)
+    )
+
+
+def classify(week_dir: Path) -> tuple[int, int]:
+    """(interactive, subagent) transcript counts. `/insights` skips subagent
+    (`agent-*`) transcripts and any session with <2 user messages / <1 min, so a
+    week of only subagent runs yields an empty insights report — worth flagging."""
+    interactive = subagent = 0
+    for f in week_dir.glob("*.jsonl"):
+        if f.name.startswith("agent-"):
+            subagent += 1
+        else:
+            interactive += 1
+    return interactive, subagent
+
+
+def parse_weeks(raw: str) -> list[str]:
+    """One week, a comma list, or an inclusive `A..B` range over what's on disk.
+    Ranges are only meaningful for the friction modes, which aggregate; the
+    model-driven passes are single-week by construction."""
+    have = available_weeks()
+    if ".." in raw:
+        lo, hi = (p.strip() for p in raw.split("..", 1))
+        for w in (lo, hi):
+            if not WEEK_RE.match(w):
+                raise ValueError(f"bad week in range: {w!r}")
+        if not have:
+            raise ValueError(f"no week folders under {SESSIONS_ROOT}")
+        lo, hi = min(lo, hi), max(lo, hi)
+        picked = [w for w in have if lo <= w <= hi]
+        if not picked:
+            raise ValueError(f"no weeks on disk between {lo} and {hi} "
+                             f"(have: {', '.join(have)})")
+        return picked
+    weeks = [w.strip() for w in raw.split(",") if w.strip()]
+    for w in weeks:
+        if not WEEK_RE.match(w):
+            raise ValueError(f"bad week format: {w!r} (want YYYY-Www)")
+    return sorted(set(weeks))
+
+
+def span_label(weeks: list[str]) -> str:
+    return weeks[0] if len(weeks) == 1 else f"{weeks[0]}..{weeks[-1]}"
+
+
+def parse_modes(raw: str) -> list[str]:
+    if raw == "all":
+        return list(ALL_MODES)
+    if raw == "weekly":
+        return list(WEEKLY_MODES)
+    modes = [m.strip() for m in raw.split(",") if m.strip()]
+    bad = [m for m in modes if m not in ALL_MODES]
+    if bad:
+        raise ValueError(f"unknown mode(s): {', '.join(bad)} "
+                         f"(choose from {', '.join(ALL_MODES)}, "
+                         f"or 'all' / 'weekly')")
+    # keep ALL_MODES order so friction's corpus exists before friction-review
+    return sorted(set(modes), key=ALL_MODES.index)
+
+
+def cmd_list() -> int:
+    weeks = available_weeks()
+    if not weeks:
+        print(f"no week folders under {SESSIONS_ROOT}", file=sys.stderr)
+        return 1
+    dflt = default_week()
+    print(f"{'week':<10}  {'sessions':>8}  detail")
+    for wk in weeks:
+        interactive, subagent = classify(SESSIONS_ROOT / wk)
+        total = interactive + subagent
+        note = "" if interactive else "  (only subagent runs — insights empty)"
+        marker = "  <- default" if wk == dflt else ""
+        print(
+            f"{wk:<10}  {total:>8}  {interactive} interactive, {subagent} subagent"
+            f"{note}{marker}"
+        )
+    return 0
+
+
+def open_file(path: Path) -> None:
+    subprocess.run(["devspaces", "agent", "open-file", str(path)], check=False)
+
+
+def run_insights(claude: str, week: str, week_dir: Path, transcripts: list[Path],
+                 out_dir: Path, model: str | None, open_report: bool,
+                 keep_temp: bool, dry_run: bool) -> tuple[int, Path | None]:
+    cmd = [claude, "-p", "/insights", "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+    if dry_run:
+        print(f"[insights] would stage {len(transcripts)} transcript(s) into a "
+              f"temp CLAUDE_CONFIG_DIR, then run: {' '.join(cmd)}")
+        return 0, None
+
+    config_dir = Path(tempfile.mkdtemp(prefix=f"insights-{week}-"))
+    staged = config_dir / "projects" / "week"
+    staged.mkdir(parents=True)
+    # copy2 keeps mtimes — /insights buckets/dates sessions by transcript mtime.
+    for t in transcripts:
+        shutil.copy2(t, staged / t.name)
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+    print("[insights] analyzing each session with the model (can take minutes)...")
+    rc, dest = 1, None
+    try:
+        subprocess.run(cmd, cwd=config_dir, env=env, timeout=1800)
+    except subprocess.TimeoutExpired:
+        print("[insights] timed out after 30m", file=sys.stderr)
+    finally:
+        report = config_dir / "usage-data" / "report.html"
+        if report.is_file():
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = out_dir / f"{week}.html"
+            shutil.copy2(report, dest)
+            rc = 0
+            print(f"[insights] report: {dest}")
+            if open_report:
+                open_file(dest)
+        else:
+            print("[insights] no report (empty week, or /insights failed)",
+                  file=sys.stderr)
+        if keep_temp:
+            print(f"[insights] kept temp config dir: {config_dir}")
+        else:
+            shutil.rmtree(config_dir, ignore_errors=True)
+    return rc, dest
+
+
+def run_prompt_pass(claude: str, mode: str, week: str, week_dir: Path,
+                    out_dir: Path, model: str | None, open_report: bool,
+                    dry_run: bool) -> tuple[int, Path | None]:
+    """Run a report-only pass (`permissions` / `skills`): give `claude -p` a prompt
+    that reads the week's transcripts (via --add-dir) and prints a markdown report,
+    which we capture to a file. Runs in a throwaway cwd + config dir so a stray
+    write can't touch any real repo or ~/.claude."""
+    if mode == "permissions":
+        prompt = "/fewer-permission-prompts " + PERMISSIONS_OVERRIDE.format(
+            week_dir=week_dir)
+    else:  # skills
+        prompt = SKILLS_PROMPT.format(week_dir=week_dir)
+
+    cmd = [claude, "-p", prompt, "--add-dir", str(week_dir),
+           "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+    if dry_run:
+        preview = prompt if len(prompt) < 80 else prompt[:77] + "..."
+        print(f"[{mode}] would run: claude -p {preview!r} --add-dir {week_dir} ...")
+        return 0, None
+
+    sandbox = Path(tempfile.mkdtemp(prefix=f"{mode}-{week}-"))
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": str(sandbox / "cfg")}
+    print(f"[{mode}] reading the week's transcripts and analyzing...")
+    rc, dest = 1, None
+    try:
+        proc = subprocess.run(cmd, cwd=sandbox, env=env, timeout=1800,
+                              capture_output=True, text=True)
+        body = (proc.stdout or "").strip()
+        if body:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = out_dir / f"{week}-{mode}.md"
+            header = f"# {week} — {mode}\n\n_Generated by claude-weekly-insights._\n\n"
+            dest.write_text(header + body + "\n")
+            rc = 0
+            print(f"[{mode}] report: {dest}")
+            if open_report:
+                open_file(dest)
+        else:
+            print(f"[{mode}] empty output; stderr tail:", file=sys.stderr)
+            print("\n".join((proc.stderr or "").splitlines()[-10:]), file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print(f"[{mode}] timed out after 30m", file=sys.stderr)
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+    return rc, dest
+
+
+def run(weeks: list[str], modes: list[str], out_dir: Path, model: str | None,
+        open_report: bool, keep_temp: bool, dry_run: bool) -> int:
+    single = modes and [m for m in modes if m not in WEEKLY_MODES]
+    if len(weeks) > 1 and single:
+        print(f"a multi-week range only works with {', '.join(WEEKLY_MODES)}; "
+              f"{', '.join(single)} analyse one week at a time", file=sys.stderr)
+        return 2
+
+    transcripts, interactive, subagent = [], 0, 0
+    for w in weeks:
+        wd = SESSIONS_ROOT / w
+        if not wd.is_dir():
+            print(f"no such week: {wd}", file=sys.stderr)
+            have = available_weeks()
+            if have:
+                print(f"available: {', '.join(have)} (or --list)", file=sys.stderr)
+            return 1
+        transcripts += sorted(wd.glob("*.jsonl"))
+        i, s = classify(wd)
+        interactive += i
+        subagent += s
+
+    if not transcripts:
+        print(f"no transcripts in {', '.join(weeks)}", file=sys.stderr)
+        return 1
+
+    label = span_label(weeks)
+    scope = label if len(weeks) == 1 else f"{label} ({len(weeks)} weeks)"
+    print(f"{scope}: {len(transcripts)} transcript(s) "
+          f"({interactive} interactive, {subagent} subagent) · modes: {', '.join(modes)}")
+    if "insights" in modes and not interactive:
+        print("warning: no interactive sessions — the insights report will likely "
+              "be empty (permissions/skills still use subagent runs)", file=sys.stderr)
+    week, week_dir = label, SESSIONS_ROOT / weeks[0]
+
+    # Only the model-driven passes need the CLI; `friction` is pure Python.
+    claude = shutil.which("claude")
+    if not claude and any(m not in LOCAL_MODES for m in modes):
+        print("`claude` not found on PATH", file=sys.stderr)
+        return 1
+
+    rc = 0
+    for mode in modes:
+        if mode == "friction":
+            r, _ = run_friction(label, transcripts, out_dir, open_report, dry_run)
+        elif mode == "friction-review":
+            r, _ = run_friction_review(claude, label, transcripts, out_dir,
+                                       model, open_report, dry_run)
+        elif mode == "insights":
+            r, _ = run_insights(claude, week, week_dir, transcripts, out_dir,
+                                model, open_report, keep_temp, dry_run)
+        else:
+            r, _ = run_prompt_pass(claude, mode, week, week_dir, out_dir, model,
+                                   open_report, dry_run)
+        rc = rc or r
+    return rc
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Analyze one week of backed-up Claude Code sessions "
+                    "(insights / permissions / skills / friction).")
+    p.add_argument("week", nargs="?", help="ISO week (2026-W30), comma list, or "
+                   "inclusive range (2026-W32..2026-W35). Ranges aggregate into "
+                   "one report and only work with the friction modes. "
+                   "Default: last complete week")
+    p.add_argument("-m", "--mode", default="insights",
+                   help="comma-separated: insights,permissions,skills,friction,"
+                        "friction-review — or 'all', or 'weekly' "
+                        "(= friction,friction-review). Default: insights. "
+                        "`friction` is local (no model, seconds); "
+                        "`friction-review` interprets its corpus with the model")
+    p.add_argument("-l", "--list", action="store_true",
+                   help="list available week folders and exit")
+    p.add_argument("-o", "--output", type=Path, default=INSIGHTS_ROOT,
+                   help=f"directory for reports (default: {INSIGHTS_ROOT})")
+    p.add_argument("--model", help="model override passed to `claude --model`")
+    p.add_argument("--open", action="store_true",
+                   help="open each report in the devspaces File Viewer when done")
+    p.add_argument("--keep-temp", action="store_true",
+                   help="keep the throwaway insights config dir (for debugging)")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="print what each pass would run, without running it")
+    args = p.parse_args()
+
+    if args.list:
+        return cmd_list()
+
+    try:
+        modes = parse_modes(args.mode)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+    try:
+        weeks = parse_weeks(args.week) if args.week else [default_week()]
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+    return run(weeks, modes, args.output, args.model, args.open, args.keep_temp,
+               args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

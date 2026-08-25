@@ -28,8 +28,9 @@ dotfiles/
 │   ├── 50-git-safe-directory.sh  # mark this repo a git safe.directory
 │   ├── 60-git-credential.sh      # repo-local GitHub PAT credential helper
 │   ├── 70-canals-env.sh    # seed canals .env.local overrides
-│   └── 80-devspaces-hooks.sh     # install workspace hooks to /mnt/personal/hooks
-├── bin/                    # helper scripts (e.g. git-credential-personal.sh)
+│   ├── 80-devspaces-hooks.sh     # install workspace hooks to /mnt/personal/hooks
+│   └── 90-claude-insights.sh     # symlink claude-weekly-insights onto PATH
+├── bin/                    # helper scripts (git-credential-personal.sh, claude-weekly-insights)
 ├── claude/                 # settings.json + CLAUDE.personal.md installed by 30
 ├── hooks/                  # devspaces workspace hooks (installed by 80)
 │   ├── lib/hooklib.py            # payload parse + episode dedup + detached inject
@@ -166,6 +167,65 @@ python3 hooks/shutdown/backup-sessions.py '{"type":"shutdown","toStatus":"stoppi
 > Requires a devspaces build that includes the `shutdown` hook event (PR #399).
 > Until that ships, `devspaces hooks list` won't surface it — the file is
 > installed and ready regardless.
+
+## Weekly insights (`bin/claude-weekly-insights`)
+
+The other half of the backup hook: analyze the consolidated sessions.
+`90-claude-insights.sh` symlinks it to `~/.local/bin/` (already on PATH).
+Passes are selectable with `--mode` (comma-separated, `all`, or `weekly`):
+
+```sh
+claude-weekly-insights                          # insights, last complete week
+claude-weekly-insights --mode weekly            # friction + friction-review
+claude-weekly-insights 2026-W30 --mode all      # every pass
+claude-weekly-insights '2026-W32..2026-W35' --mode friction   # aggregate a range
+claude-weekly-insights --list                   # which weeks exist, and which have real sessions
+claude-weekly-insights 2026-W30 --open          # open each report in the File Viewer
+```
+
+Reports land in `/mnt/personal/claude-insights/`. The first three shell out to
+`claude` and cost tokens; the fourth is local Python and costs seconds.
+
+- **`insights`** → `<week>.html` — Claude Code's built-in `/insights` usage
+  report. It only analyzes transcripts under its config dir's `projects/` tree
+  and writes to `<config-dir>/usage-data/report.html`, so the script stages the
+  week into a throwaway `CLAUDE_CONFIG_DIR` (auth is env-based —
+  `ANTHROPIC_API_KEY` — so it survives the switch), runs `claude -p /insights`
+  there, and harvests the HTML. Skips subagent (`agent-*`) and trivial sessions,
+  so a subagent-only week yields an empty report (`--list` flags which weeks have
+  interactive sessions).
+- **`permissions`** → `<week>-permissions.md` — the built-in
+  `fewer-permission-prompts` skill, pointed at the week and forced report-only
+  (its argument overrides the hardcoded `~/.claude/projects` scan root and the
+  settings.json write). A prioritized read-only allowlist derived from the week's
+  actual Bash/MCP calls.
+- **`skills`** → `<week>-skills.md` — mines the week for recurring, repeatable
+  workflows and proposes new skills to create.
+- **`friction`** → `<week>-friction.md` + `<week>-friction.json` — local, no
+  model, seconds even over a month of transcripts. Counts where the week went
+  wrong: interrupts (and commands re-run after being killed), corrective
+  messages, AskUserQuestion stalls and how often they were rejected, refused tool
+  calls, missing commands, hook errors and per-hook latency, context
+  compactions, oversized tool results, files re-derived across many sessions,
+  subagent cost-vs-return, and which skills actually ran. Read the **Alarms**
+  block; the correction-pattern profile is a stable fingerprint week to week and
+  says little on its own.
+- **`friction-review`** → `<week>-friction-review.md` — the interpretation half,
+  and the one worth reading weekly. Hands the model the complete `friction`
+  corpus (not a file sample) plus `friction-ledger.md`, a running list of
+  findings already reported, and asks only for what's new: failure modes the
+  hand-written patterns can't name, corrections that violate a rule already in
+  `CLAUDE.personal.md` (meaning that rule needs sharpening), and conventions
+  being re-explained often enough to deserve a skill. The ledger is what stops a
+  weekly cadence from reprinting the same themes.
+
+Alarms are gated on the last week of available data, because a date-blind alarm
+re-reports finished problems: six commands installed in the image kept alarming
+for three weeks after the fix landed. Raw totals track how much got *captured*,
+not how much went wrong — divide by interactive session count before comparing
+weeks.
+
+`-n/--dry-run` prints what each pass would run without spending tokens.
 
 ## rtk (Rust Token Killer)
 
