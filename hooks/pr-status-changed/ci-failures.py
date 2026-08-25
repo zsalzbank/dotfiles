@@ -23,14 +23,30 @@ if hooklib.is_terminal(payload):
 
 repo, num, url = hooklib.ref(payload)
 key = f"ci-failures-{repo}#{num}"
+checks = hooklib.current(payload).get("checks")
 
-if hooklib.current(payload).get("checks") == "failure":
-    if hooklib.episode_guard(key, "failure"):
+if checks == "failure":
+    # Signature is the SET OF FAILING CHECK NAMES, not the bare word "failure".
+    # A constant signature can't tell a new failure from the one you were already
+    # told about, and since `episode_clear` used to run on any non-failure rollup
+    # (`pending` included), the ordinary fail -> re-run -> fail cycle re-armed the
+    # guard and re-notified — one PR got pinged 7 times for the same break.
+    names = hooklib.failing_checks(repo, num)
+    sig = hooklib.failure_sig(names)
+    if not hooklib.is_ignored(key, sig) and hooklib.episode_guard(key, sig):
+        failing = ", ".join(names) if names else "unknown (couldn't read the check list)"
         hooklib.inject(
             "ci-failures",
-            f"A hook detected CI failures on {repo}#{num} ({url}). Run the "
-            "/canals:plan-from-ci-failures workflow for it in a background subagent "
-            "so I can keep working, and report the fix plan when it's ready.",
+            f"A hook detected CI failures on {repo}#{num} ({url}). Failing: "
+            f"{failing}. First work out whether these are caused by this branch's "
+            "diff. If they are, run the /canals:plan-from-ci-failures workflow in a "
+            "background subagent so I can keep working, and report the fix plan "
+            "when it's ready. If they are NOT ours — a flake, a break already on "
+            "master, or infra — don't fix them: tell me, and record it so this "
+            "stops re-notifying:\n"
+            f"  python3 /mnt/personal/hooks/lib/hooklib.py ignore {repo}#{num} \"<why>\"",
         )
-else:
+elif checks == "success":
+    # Deliberately NOT clearing on pending/merging/deploy-blocked: those are just
+    # CI in flight, and clearing there is what caused the repeat notifications.
     hooklib.episode_clear(key)
