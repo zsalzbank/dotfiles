@@ -24,6 +24,7 @@ dotfiles/
 │   ├── 10-shell.sh         # symlink bash profile + ~/.bashrc.d, wire ~/.bashrc
 │   ├── 20-git-scripts.sh   # fetch git-prompt.sh / git-completion.bash
 │   ├── 30-claude.sh        # Claude settings merge, personal CLAUDE.md, plugins
+│   ├── 35-claude-skills.sh # symlink claude/skills/* into ~/.claude/skills
 │   ├── 40-rtk.sh           # install + verify pinned rtk, enable it, telemetry off
 │   ├── 50-git-safe-directory.sh  # mark this repo a git safe.directory
 │   ├── 60-git-credential.sh      # repo-local GitHub PAT credential helper
@@ -32,6 +33,7 @@ dotfiles/
 │   └── 90-claude-insights.sh     # symlink claude-weekly-insights onto PATH
 ├── bin/                    # helper scripts (git-credential-personal.sh, claude-weekly-insights)
 ├── claude/                 # settings.json + CLAUDE.personal.md installed by 30
+│   └── skills/             # personal Claude skills, symlinked into ~/.claude/skills by 35
 ├── hooks/                  # devspaces workspace hooks (installed by 80)
 │   ├── lib/hooklib.py            # payload parse + episode dedup + detached inject
 │   ├── pr-status-changed/        # review-comments / merge-conflict / ci-failures (Python)
