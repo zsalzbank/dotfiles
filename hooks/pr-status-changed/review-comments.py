@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pr-status-changed hook: unresolved review comments -> /plan-from-pr-comments."""
+"""pr-status-changed hook: unresolved review comments -> plan-from-pr-comments."""
 
 import sys
 
@@ -24,7 +24,8 @@ if hooklib.current(payload).get("unresolved") is True:
     if hooklib.episode_guard(key, sig):
         hooklib.inject(
             "review-comments",
-            f"/canals:plan-from-pr-comments (hook: {repo}#{num} has unresolved review comments — {url})",
+            f"{hooklib.skill('canals:plan-from-pr-comments')} "
+            f"(hook: {repo}#{num} has unresolved review comments — {url})",
         )
 else:
     hooklib.episode_clear(key)

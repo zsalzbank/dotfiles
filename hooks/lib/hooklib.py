@@ -25,11 +25,27 @@ from pathlib import Path
 MARKER_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "devspaces" / "hook-episodes"
 LOG_DIR = Path("/tmp/devspaces/hooks")
 DEVSPACES_BIN = os.environ.get("DEVSPACES_AGENT_BIN", "devspaces")
+CUSTOM_ENV_FILE = Path(os.environ.get("DEVSPACES_CUSTOM_ENV_FILE", "/etc/custom.env"))
 # Episode markers live in /tmp and die with the pod — fine for de-duping repeated
 # deliveries. A "this failure is unrelated, stop telling me" decision has to
 # outlive the pod, so it goes on the personal volume instead.
 IGNORE_DIR = Path(os.environ.get("DEVSPACES_HOOK_IGNORE_DIR",
                                  "/mnt/personal/hooks/state/ci-ignore"))
+
+
+def skill(name: str) -> str:
+    """Format a plugin skill invocation for the workspace's selected agent."""
+    frontend = os.environ.get("DEVSPACES_CLAUDE_FRONTEND")
+    if not frontend:
+        try:
+            for line in CUSTOM_ENV_FILE.read_text().splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key == "DEVSPACES_CLAUDE_FRONTEND":
+                    frontend = value.strip().strip("'\"")
+                    break
+        except OSError:
+            pass
+    return f"${name}" if frontend == "codex" else f"/{name}"
 
 
 def load_payload() -> dict:

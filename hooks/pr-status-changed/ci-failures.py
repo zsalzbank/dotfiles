@@ -39,7 +39,8 @@ if checks == "failure":
             "ci-failures",
             f"A hook detected CI failures on {repo}#{num} ({url}). Failing: "
             f"{failing}. First work out whether these are caused by this branch's "
-            "diff. If they are, run the /canals:plan-from-ci-failures workflow in a "
+            f"diff. If they are, run the {hooklib.skill('canals:plan-from-ci-failures')} "
+            "workflow in a "
             "background subagent so I can keep working, and report the fix plan "
             "when it's ready. If they are NOT ours — a flake, a break already on "
             "master, or infra — don't fix them: tell me, and record it so this "

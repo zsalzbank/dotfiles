@@ -106,13 +106,13 @@ invoked with the event JSON as `argv[1]` and install **disabled**.
 ### `pr-status-changed/` — react to a PR I opened changing
 
 Fires when a PR I opened from a workspace changes. Each hook reacts to the
-payload and **types a command into the running Claude session** by shelling out
+payload and **types a command into the running agent session** by shelling out
 to `devspaces agent send-message` (see below):
 
 | Hook                 | Fires when                          | Injects                                              |
 | -------------------- | ----------------------------------- | --------------------------------------------------- |
-| `review-comments.py` | PR gains unresolved review comments | `/plan-from-pr-comments`                            |
-| `merge-conflict.py`  | PR develops a merge conflict        | `/merge-master`                                     |
+| `review-comments.py` | PR gains unresolved review comments | `plan-from-pr-comments`                             |
+| `merge-conflict.py`  | PR develops a merge conflict        | `merge-master`                                      |
 | `ci-failures.py`     | checks rollup goes `failure`        | run `plan-from-ci-failures` in a background subagent |
 
 `hooklib.py` parses the event, dedups with per-episode marker files (the
@@ -121,12 +121,18 @@ launches `devspaces agent send-message --wait-idle "<text>"` **detached**,
 so the hook returns under the agent's 60s timeout while the CLI does the waiting
 and typing.
 
+Skill invocations use the selected agent's native plugin syntax: `/canals:...`
+for Claude Code and `$canals:...` for Codex. The hook process does not inherit
+the frontend setting, so `hooklib.py` reads it from the workspace's
+`/etc/custom.env` boot snapshot.
+
 The `devspaces agent send-message` command (in the devspaces CLI) owns the
-injection: it resolves the `zmx` session, and with `--wait-idle` injects
-immediately if Claude is busy (Claude queues it) or waits until the screen has
-been idle (`--idle-secs`, default 30s — i.e. the user paused) otherwise, then
-bracketed-pastes + submits. Only the `cli` frontend has a TUI; on web/bot it
-no-ops. **Requires a devspaces build that includes `send-message`.**
+injection: it resolves the selected agent's `zmx` session, and with `--wait-idle`
+injects immediately if the agent is busy (the TUI queues it) or waits until the
+screen has been idle (`--idle-secs`, default 30s — i.e. the user paused)
+otherwise, then bracketed-pastes + submits. Claude Code and Codex have supported
+TUI profiles; on web/bot it no-ops. **Requires a devspaces build that includes
+`send-message`.**
 
 Hooks install **disabled**. Enable them per workspace:
 

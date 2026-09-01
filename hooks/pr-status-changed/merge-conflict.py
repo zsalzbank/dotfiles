@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pr-status-changed hook: merge conflict -> /merge-master."""
+"""pr-status-changed hook: merge conflict -> merge-master."""
 
 import sys
 
@@ -17,7 +17,8 @@ if hooklib.current(payload).get("conflict") is True:
     if hooklib.episode_guard(key, "conflict"):
         hooklib.inject(
             "merge-conflict",
-            f"/canals:merge-master (hook: {repo}#{num} has a merge conflict — {url})",
+            f"{hooklib.skill('canals:merge-master')} "
+            f"(hook: {repo}#{num} has a merge conflict — {url})",
         )
 else:
     hooklib.episode_clear(key)

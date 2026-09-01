@@ -4,7 +4,7 @@
 #
 #   pr-status-changed/*  react to a PR I opened changing (CI, review comments,
 #                        merge conflict) by typing a command into the running
-#                        Claude session (via `devspaces agent send-message`).
+#                        agent session (via `devspaces agent send-message`).
 #   shutdown/*           run at pod teardown (stop/destroy) — e.g. back up
 #                        Claude sessions to /mnt/personal before the pod goes away.
 #
