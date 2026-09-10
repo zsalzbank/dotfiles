@@ -30,8 +30,9 @@ dotfiles/
 │   ├── 60-git-credential.sh      # repo-local GitHub PAT credential helper
 │   ├── 70-canals-env.sh    # seed canals .env.local overrides
 │   ├── 80-devspaces-hooks.sh     # install workspace hooks to /mnt/personal/hooks
-│   └── 90-claude-insights.sh     # symlink claude-weekly-insights onto PATH
-├── bin/                    # helper scripts (git-credential-personal.sh, claude-weekly-insights)
+│   ├── 90-claude-insights.sh     # symlink claude-weekly-insights onto PATH
+│   └── 91-gh-triage.sh           # symlink gh-triage onto PATH
+├── bin/                    # helper scripts (git-credential-personal.sh, claude-weekly-insights, gh-triage)
 ├── claude/                 # settings.json + CLAUDE.personal.md installed by 30
 │   └── skills/             # personal Claude skills, symlinked into ~/.claude/skills by 35
 ├── hooks/                  # devspaces workspace hooks (installed by 80)
@@ -246,6 +247,31 @@ not how much went wrong — divide by interactive session count before comparing
 weeks.
 
 `-n/--dry-run` prints what each pass would run without spending tokens.
+
+## Notification cleanup (`bin/gh-triage`)
+
+Clears the GitHub notifications you were never going to read.
+
+```sh
+gh-triage clean              # plan, then asks before acting
+gh-triage clean --apply      # skip the question (scripts, cron)
+```
+
+`clean` marks done every unread notification that is a draft PR, a PR closed
+without merging, or not a PR at all (check failures and the like). Merged PRs are
+left alone. It prints the plan and asks; `--apply` answers yes up front, and a
+non-interactive shell without it refuses rather than hanging. Before acting it
+re-checks the affected PRs against the API, so a cached plan can never mark done
+something that has since reopened. Marking done leaves the subscription intact,
+so a thread comes back if someone comments again.
+
+PR state is cached in `~/.cache/gh-triage/prs.json`, keyed on the notification's
+`updated_at`, so only threads with new activity are re-fetched. `rm` that file to
+force a full refresh.
+
+Needs a **classic** PAT with the `notifications` scope in
+`GITHUB_NOTIFICATIONS_PAT` -- fine-grained PATs get 403 on that endpoint whatever
+their permissions. PR state goes through `gh`.
 
 ## rtk (Rust Token Killer)
 

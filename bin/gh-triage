@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Clear the GitHub notifications you were never going to read.
+
+  clean   Mark done every unread notification that is a draft PR, a PR closed
+          without merging, or not a PR at all (check failures and the like).
+          Merged PRs are left alone. Prints the plan and asks; --apply skips
+          the question for scripted runs.
+
+PR state is cached in ~/.cache/gh-triage/prs.json and only re-fetched when the
+notification's updated_at moves, so a second run in the same session costs one
+list call. Delete that file to force a full refresh.
+
+Listing notifications needs a classic PAT with the `notifications` scope in
+GITHUB_NOTIFICATIONS_PAT -- fine-grained PATs cannot reach that endpoint at all.
+PR state is read through `gh`, which already holds org access.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+API = "https://api.github.com"
+CACHE = Path(os.environ.get("GH_TRIAGE_CACHE", Path.home() / ".cache" / "gh-triage"))
+PR_CACHE = CACHE / "prs.json"
+PR_CACHE_MAX_AGE = 30 * 86400
+
+
+# ---------------------------------------------------------------- github
+
+def notif_token():
+    tok = os.environ.get("GITHUB_NOTIFICATIONS_PAT")
+    if not tok:
+        sys.exit(
+            "GITHUB_NOTIFICATIONS_PAT is not set.\n"
+            "Create a *classic* PAT with the `notifications` scope "
+            "(fine-grained tokens cannot list notifications) and export it."
+        )
+    return tok
+
+
+def get_notifications():
+    tok, out, page = notif_token(), [], 1
+    while page <= 40:
+        req = urllib.request.Request(
+            f"{API}/notifications?per_page=100&page={page}",
+            headers={"Authorization": f"token {tok}", "Accept": "application/vnd.github+json"},
+        )
+        try:
+            with urllib.request.urlopen(req) as r:
+                batch = json.load(r)
+        except urllib.error.HTTPError as e:
+            sys.exit(f"notifications API {e.code}: {e.read().decode()[:200]}")
+        # The endpoint caps a page at 50 regardless of per_page, so an empty
+        # batch is the only reliable end-of-list signal.
+        if not batch:
+            break
+        out.extend(batch)
+        page += 1
+    return out
+
+
+def gh_graphql(query: str):
+    p = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        return {}
+    try:
+        return json.loads(p.stdout).get("data") or {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _load_pr_cache():
+    try:
+        return json.loads(PR_CACHE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_pr_cache(cache):
+    cutoff = time.time() - PR_CACHE_MAX_AGE
+    keep = {k: v for k, v in cache.items() if v.get("seen", 0) >= cutoff}
+    CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = PR_CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(keep))
+    tmp.replace(PR_CACHE)
+
+
+def fetch_prs(refs, notif_updated=None):
+    """refs: [(owner, repo, number)] -> {(owner,repo,number): pr dict}
+
+    A PR is only re-fetched when its notification's updated_at has moved.
+    GitHub bumps that on new commits, comments, and state changes, so an
+    unchanged timestamp means the cached copy still describes the PR. Passing no
+    timestamps skips the cache entirely.
+    """
+    cache = _load_pr_cache()
+    now, found, stale = time.time(), {}, []
+    for ref in refs:
+        key = f"{ref[0]}/{ref[1]}#{ref[2]}"
+        hit = cache.get(key)
+        stamp = (notif_updated or {}).get(ref)
+        if hit and stamp and hit.get("stamp") == stamp:
+            found[ref] = hit["pr"]
+            hit["seen"] = now
+        else:
+            stale.append(ref)
+
+    for i in range(0, len(stale), 25):
+        chunk = stale[i:i + 25]
+        parts = []
+        for n, (o, r, num) in enumerate(chunk):
+            parts.append(
+                f'a{n}: repository(owner:"{o}", name:"{r}"){{ '
+                f'pullRequest(number:{num}){{ number title isDraft state }} }}'
+            )
+        data = gh_graphql("query{ " + " ".join(parts) + " }")
+        for n, ref in enumerate(chunk):
+            node = (data.get(f"a{n}") or {}).get("pullRequest")
+            if not node:
+                continue
+            found[ref] = node
+            stamp = (notif_updated or {}).get(ref)
+            if stamp:
+                cache[f"{ref[0]}/{ref[1]}#{ref[2]}"] = {
+                    "stamp": stamp, "pr": node, "seen": now,
+                }
+
+    if notif_updated:
+        _save_pr_cache(cache)
+        print(f"  {len(refs) - len(stale)} cached, {len(stale)} fetched", file=sys.stderr)
+    return found
+
+
+NOTIF_URL = re.compile(r"/repos/([^/]+)/([^/]+)/pulls/(\d+)")
+
+
+def notif_ref(n):
+    m = NOTIF_URL.search((n.get("subject") or {}).get("url") or "")
+    return (m.group(1), m.group(2), int(m.group(3))) if m else None
+
+
+# ---------------------------------------------------------------- mutate
+
+def confirm(question):
+    """Ask before a mutation. Non-interactive callers must pass --apply instead."""
+    if not sys.stdin.isatty():
+        print(f"\nnot a terminal; re-run with --apply to {question}")
+        return False
+    try:
+        return input(f"\n{question}? [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def mark_done(thread_id):
+    """DELETE clears the thread from the inbox; PATCH would only mark it read.
+
+    The subscription is left alone, so a thread cleared as done comes back the
+    next time someone comments.
+    """
+    req = urllib.request.Request(
+        f"{API}/notifications/threads/{thread_id}",
+        method="DELETE",
+        headers={"Authorization": f"token {notif_token()}",
+                 "Accept": "application/vnd.github+json"},
+    )
+    try:
+        urllib.request.urlopen(req)
+        return True
+    except urllib.error.HTTPError as e:
+        print(f"   thread {thread_id}: HTTP {e.code}", file=sys.stderr)
+        return False
+
+
+def cmd_clean(args):
+    notifs = get_notifications()
+    refs, plan, stamps = [], [], {}
+    for n in notifs:
+        ref = notif_ref(n)
+        if ref:
+            refs.append((ref, n))
+            stamps[ref] = n.get("updated_at")
+        else:
+            plan.append((n, (n.get("subject") or {}).get("type", "?")))
+    detail = fetch_prs([r for r, _ in refs], stamps)
+    for ref, n in refs:
+        pr = detail.get(ref)
+        if pr and (pr["isDraft"] or pr["state"] == "CLOSED"):
+            plan.append((n, "draft" if pr["isDraft"] else "abandoned"))
+
+    if not plan:
+        print("nothing to clean")
+        return
+    print(f"{'would mark done' if not args.apply else 'marking done'}: {len(plan)}\n")
+    for n, why in plan:
+        print(f"   [{why:<8}] {n['repository']['full_name']}  {(n.get('subject') or {}).get('title','')[:64]}")
+    if not args.apply and not confirm(f"mark these {len(plan)} done"):
+        print("left alone")
+        return
+
+    # The plan may have been built from cached PR state. Marking done cannot be
+    # undone from here, so confirm the ones about to be cleared are still draft
+    # or abandoned, straight from the API.
+    recheck = [ref for ref, n in refs if any(n is p for p, _ in plan)]
+    fresh = fetch_prs(recheck)
+    dropped = []
+    for ref, n in refs:
+        pr = fresh.get(ref)
+        if pr and not (pr["isDraft"] or pr["state"] == "CLOSED"):
+            dropped.append((n, pr["state"].lower()))
+    if dropped:
+        plan = [(n, w) for n, w in plan if not any(n is d for d, _ in dropped)]
+        print(f"\nskipping {len(dropped)} that changed since the plan:")
+        for n, st in dropped:
+            print(f"   [{st:<8}] {(n.get('subject') or {}).get('title','')[:64]}")
+    if not plan:
+        print("\nnothing left to mark done")
+        return
+    ok = sum(mark_done(n["id"]) for n, _ in plan)
+    print(f"\nmarked done: {ok}/{len(plan)}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="gh-triage", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("clean", help="mark done drafts, abandoned PRs, non-PR notifications")
+    c.add_argument("--apply", action="store_true")
+    c.set_defaults(func=cmd_clean)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
