@@ -8,3 +8,9 @@ bash/bashrc.d/99-local.sh
 # Python bytecode.
 __pycache__/
 *.pyc
+
+# Built by install.d/91-gh-triage.sh, not committed.
+.venv-gh-triage/
+
+# Test runner scratch.
+.pytest_cache/

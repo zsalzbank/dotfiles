@@ -1,4 +1,9 @@
-# gh-triage: symlink the notification cleanup CLI.
+# gh-triage: put the notification triage CLI on PATH.
+#
+# Only a symlink. The launcher builds its own venv on first run (under
+# ~/.local/share/gh-triage) so it works from a bare clone on any machine, which
+# means there is nothing for the installer to prepare. Building it here anyway
+# just moves the one-time cost to workspace start.
 
 install_gh_triage() {
   local bindir="$HOME/.local/bin"
