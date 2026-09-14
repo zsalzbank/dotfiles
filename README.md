@@ -248,30 +248,84 @@ weeks.
 
 `-n/--dry-run` prints what each pass would run without spending tokens.
 
-## Notification cleanup (`bin/gh-triage`)
+## Notification triage (`bin/gh-triage`)
 
-Clears the GitHub notifications you were never going to read.
+A searchable list of the GitHub notification inbox. The web UI can't search
+notification titles, which is what makes a few hundred unread unworkable.
 
 ```sh
-gh-triage clean              # plan, then asks before acting
+gh-triage                    # the TUI
+gh-triage clean              # non-interactive sweep; asks before acting
 gh-triage clean --apply      # skip the question (scripts, cron)
 ```
 
+### Keys
+
+| | |
+|---|---|
+| `/` | filter; `escape` clears it and returns to the list |
+| `space` | check the row |
+| `v` `a` `x` | check what's on screen / everything the filter shows / nothing |
+| `c` | check everything `clean` would sweep |
+| `o` | open the checked PRs in browser tabs |
+| `d` `u` | mark done / unsubscribe (both confirm first) |
+| `r` `q` | reload the inbox / quit |
+
+With nothing checked, `o`/`d`/`u` act on the row under the cursor. Checks
+survive a filter change, so you can search, check, search again, check, and act
+on the union -- the status line says how many of them the current filter hides.
+Oldest first, since the stale end is the part that needs deciding.
+
+### Filters
+
+Plain words match the title, repo and number. `author:`, `repo:` and `status:`
+match that field, all substrings: `author:debug` finds `canals-ai-debugger`, and
+a trailing `[bot]` is dropped so a filter pasted from a notifications URL works.
+Terms combine, so `status:draft author:debug` is both. `author:` and `status:`
+need the PR state that loads in the background; until it lands the status line
+says so rather than showing an empty list.
+
+### Acting
+
+`d` marks done: the thread leaves the inbox but the subscription stays, so a new
+comment brings it back. `u` unsubscribes, which takes **two** requests --
+ignoring the subscription stops future pings but leaves the notification in the
+inbox, and deleting the thread clears the row but leaves the repo watch in
+place, so either alone looks broken in a different way. Both print what they're
+about to touch and wait for a `y`.
+
 `clean` marks done every unread notification that is a draft PR, a PR closed
 without merging, or not a PR at all (check failures and the like). Merged PRs are
-left alone. It prints the plan and asks; `--apply` answers yes up front, and a
-non-interactive shell without it refuses rather than hanging. Before acting it
-re-checks the affected PRs against the API, so a cached plan can never mark done
-something that has since reopened. Marking done leaves the subscription intact,
-so a thread comes back if someone comments again.
+left alone. Before acting it re-checks the affected PRs against the API, so a
+cached plan can never mark done something that has since reopened. `c` is the
+same rule applied to the current view.
+
+`o` hands the urls to the platform opener, so run it where your browser is; in a
+remote workspace there is no browser to open and it prints them instead.
+
+### Requirements
+
+A **classic** PAT with the `notifications` scope in `GITHUB_NOTIFICATIONS_PAT`
+-- fine-grained PATs get 403 on that endpoint whatever their permissions -- plus
+an authenticated `gh` for PR state.
+
+The three files in `bin/` are the whole program: the launcher builds its own venv
+under `~/.local/share/gh-triage` on first run, so it works from a bare clone on
+any machine with `python3`. `GH_TRIAGE_PYTHON` points it at an interpreter you
+manage instead. `clean` is stdlib-only and works even when that venv doesn't.
 
 PR state is cached in `~/.cache/gh-triage/prs.json`, keyed on the notification's
 `updated_at`, so only threads with new activity are re-fetched. `rm` that file to
 force a full refresh.
 
-Needs a **classic** PAT with the `notifications` scope in
-`GITHUB_NOTIFICATIONS_PAT` -- fine-grained PATs get 403 on that endpoint whatever
-their permissions. PR state goes through `gh`.
+### Action log
+
+Every action appends a JSONL record to `~/.local/share/gh-triage/actions.jsonl`
+(the persistent share in a devspaces pod; `GH_TRIAGE_LOG` overrides both), with
+one line per PR plus a per-session record of what was left alone. Each line
+carries **how** the selection was made -- a deliberate `space` reads differently
+from a screenful swept by one `v` -- which is the difference between training
+data and noise if these decisions are ever replayed.
 
 ## rtk (Rust Token Killer)
 
