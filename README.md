@@ -93,7 +93,12 @@ the latest version from the upstream git repository.
 `~/.claude/settings.json`: it creates the file if absent, or deep-merges into it
 (repo values win on conflicts, existing settings preserved) using `jq`. If `jq`
 isn't installed it's installed via `apt-get` (Ubuntu). Currently this disables
-Claude's commit/PR attribution.
+Claude's commit/PR attribution and pins the output style back to `default`.
+
+The workspace image seeds `outputStyle: "Concise"` into `~/.claude/settings.json`
+at launch, but only when the key is absent (`seedOutputStyle()` in
+`infrastructure/services/coder/config/workspace_utils/src/agents/claude/setup.mjs`).
+Dotfiles run after that setup, so setting the key here wins in every workspace.
 
 ## Devspaces workspace hooks
 
