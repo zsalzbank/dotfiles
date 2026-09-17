@@ -3,5 +3,6 @@
     "commit": "",
     "pr": ""
   },
+  "bashEditDiffEnabled": false,
   "outputStyle": "default"
 }

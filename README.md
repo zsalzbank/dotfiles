@@ -93,7 +93,10 @@ the latest version from the upstream git repository.
 `~/.claude/settings.json`: it creates the file if absent, or deep-merges into it
 (repo values win on conflicts, existing settings preserved) using `jq`. If `jq`
 isn't installed it's installed via `apt-get` (Ubuntu). Currently this disables
-Claude's commit/PR attribution and pins the output style back to `default`.
+Claude's commit/PR attribution, pins the output style back to `default`, and
+sets `bashEditDiffEnabled: false` so Bash-tool file edits don't come back with a
+diff (unset, it turns itself on under `auto` and `bypassPermissions`, which is
+every workspace session).
 
 The workspace image seeds `outputStyle: "Concise"` into `~/.claude/settings.json`
 at launch, but only when the key is absent (`seedOutputStyle()` in
