@@ -6,7 +6,7 @@
 #                        merge conflict) by typing a command into the running
 #                        agent session (via `devspaces agent send-message`).
 #   shutdown/*           run at pod teardown (stop/destroy) — e.g. back up
-#                        Claude sessions to /mnt/personal before the pod goes away.
+#                        agent sessions to /mnt/personal before the pod goes away.
 #
 # Installs them all DISABLED — enable per workspace with `devspaces hooks enable`
 # (add `--global` to enable for every workspace). Each hook dir under hooks/ maps

@@ -38,7 +38,7 @@ dotfiles/
 ├── hooks/                  # devspaces workspace hooks (installed by 80)
 │   ├── lib/hooklib.py            # payload parse + episode dedup + detached inject
 │   ├── pr-status-changed/        # review-comments / merge-conflict / ci-failures (Python)
-│   └── shutdown/                 # backup-sessions.py — back up Claude sessions at teardown
+│   └── shutdown/                 # backup-sessions.py — back up agent sessions at teardown
 └── bash/
     ├── .bash_profile       # loader — sources everything in ~/.bashrc.d/*.sh
     └── bashrc.d/
@@ -153,23 +153,24 @@ devspaces hooks enable ci-failures.py review-comments.py merge-conflict.py
 Test a hook offline with `DEVSPACES_HOOK_DRYRUN=1 python3 hooks/pr-status-changed/ci-failures.py "$(cat payload.json)"`
 (prints what it would inject instead of sending).
 
-### `shutdown/` — back up Claude sessions at teardown
+### `shutdown/` — back up Claude and Codex sessions at teardown
 
 `backup-sessions.py` runs at pod teardown (stop *or* destroy), via the devspaces
-`shutdown` hook event (see devspaces PR #399). Claude Code's session transcripts
-under `~/.claude/projects/` are per-pod and vanish when the pod is torn down;
-this copies every transcript into the durable personal share, bucketed by the
-ISO week (UTC) of the session's last edit, so a weekly `claude insights` pass can
-distill learnings across every workspace:
+`shutdown` hook event (see devspaces PR #399). Claude Code transcripts under
+`~/.claude/projects/` and Codex transcripts under `~/.codex/sessions/` (plus
+`~/.codex/archived_sessions/` when present) are per-pod and vanish when the pod
+is torn down. The hook copies them into separate folders on the durable personal
+share, bucketed by the ISO week (UTC) of each session's last edit:
 
 ```
 /mnt/personal/claude-sessions/<YYYY-Www>/<session-id>.jsonl
+/mnt/personal/codex-sessions/<YYYY-Www>/<rollout-filename>.jsonl
 ```
 
 See the docstring in `hooks/shutdown/backup-sessions.py` for the full rules
-(week bucketing, one-bucket-per-session pruning, why the session UUID is a
-sufficient key). Enable it (its trigger runs on the way down, so there's nothing
-to "see" until the next stop/destroy):
+(week bucketing, one-bucket-per-session pruning, filename keys). The Claude
+copies feed the weekly `claude insights` pass. Enable the hook (its trigger runs
+on the way down, so there's nothing to "see" until the next stop/destroy):
 
 ```sh
 devspaces hooks enable backup-sessions.py     # or --global for every workspace
