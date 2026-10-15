@@ -9,9 +9,6 @@ export EDITOR=vim
 export NX_DAEMON=false
 export NX_PARALLEL=8
 
-# Claude Code
-export CLAUDE_CODE_SCROLL_SPEED=8
-
 # rtk (Rust Token Killer) — installed to ~/.local/bin by install.sh.
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
