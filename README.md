@@ -103,6 +103,18 @@ at launch, but only when the key is absent (`seedOutputStyle()` in
 `infrastructure/services/coder/config/workspace_utils/src/agents/claude/setup.mjs`).
 Dotfiles run after that setup, so setting the key here wins in every workspace.
 
+## Codex settings
+
+`install.d/36-codex.sh` merges `codex/config.toml` into
+`${CODEX_HOME:-~/.codex}/config.toml`, creating it if absent. Repo values win
+on conflicts; existing settings and comments are preserved. Changed files are
+backed up to `config.toml.backup.<timestamp>`. Repeated installs with the same
+settings leave the file untouched.
+
+The merge uses `tomlkit`, installed in a dedicated Python virtual environment
+under `~/.local/share/dotfiles-codex/` if unavailable in system Python.
+Currently it sets `[tui] mouse_scroll_speed = 8.0`.
+
 ## Devspaces workspace hooks
 
 `80-devspaces-hooks.sh` installs the Python hooks in `hooks/` onto the personal
