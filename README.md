@@ -23,6 +23,7 @@ dotfiles/
 ├── install.d/              # one file per install feature (see "Install steps")
 │   ├── 10-shell.sh         # symlink bash profile + ~/.bashrc.d, wire ~/.bashrc
 │   ├── 20-git-scripts.sh   # fetch git-prompt.sh / git-completion.bash
+│   ├── 25-skills-repo.sh   # update clean skills master checkout + agent plugins
 │   ├── 30-claude.sh        # Claude settings merge, personal CLAUDE.md, plugins
 │   ├── 35-claude-skills.sh # symlink claude/skills/* into ~/.claude/skills
 │   ├── 40-rtk.sh           # install + verify pinned rtk, enable it, telemetry off
@@ -86,6 +87,22 @@ merged Claude settings).
 `~/.git-completion.bash` by copying from a system location if one exists
 (common Linux paths, macOS Command Line Tools / Xcode), otherwise downloading
 the latest version from the upstream git repository.
+
+## Shared skills updates
+
+`25-skills-repo.sh` pulls `/home/canals/repositories/skills` from `origin/master`
+only when it is on `master` with no staged, unstaged, untracked, or submodule
+changes. The pull allows only fast-forward updates, with rebasing and
+autostashing disabled. Other branches, detached HEADs, and missing checkouts
+are skipped.
+
+After a successful pull, it refreshes the `canals@canals-skills` plugin for
+Codex when its CLI is available. Codex reinstalls the local plugin to refresh
+its cache even if the plugin version has not changed. Claude reads the local
+plugin directly and picks up changes when its next session starts.
+The workspace launcher runs dotfiles on every pod start before starting the
+selected agent. The pull has a 60-second timeout and the Codex refresh has
+a 30-second timeout; failures are logged and startup continues.
 
 ## Claude Code settings
 
