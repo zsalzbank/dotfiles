@@ -1,145 +1,194 @@
 ---
 name: erp-probe
-description: Write, fix, or extend an ERP probe — a standalone bash script that hits a live Eclipse / P21 / Infor instance to settle a question the code can't answer. Use whenever the task involves creating or changing a probe, or when someone asks to "probe" an ERP, verify an org's ERP configuration or permissions, confirm what an ERP field or status actually does, or test an ERP call against sandbox or production before shipping a change. Also use when asked for a probe "like the others" or "like the existing ones" — this captures those conventions so they don't have to be re-explained.
+description: Write, fix, or extend an ERP probe — a script that goes through the Canals ERP proxy (Chrome console script, or the local ERP bridge for sandbox) to settle a question about a live Eclipse / P21 / Infor instance that the code can't answer. Use whenever the task involves creating or changing a probe, or when someone asks to "probe" an ERP, verify an org's ERP configuration or permissions, confirm what an ERP field or status actually does, or test an ERP call against sandbox or production before shipping a change. Also use when asked for a probe "like the others" or "like the existing ones" — this captures those conventions so they don't have to be re-explained.
 ---
 
 # ERP probes
 
-Write (or fix) a standalone ERP probe script that answers a question about a real
-ERP instance, and hand it over ready to run.
+Write (or fix) a probe that answers a question about a real ERP instance, and hand
+it over ready to run. A probe is the thing that turns "I think" into "I checked".
 
-A probe is a self-contained bash script that talks to a live ERP (Eclipse, P21,
-Infor) to settle a question the code can't answer — what a field does, whether a
-status is inert, whether an org is configured for a feature. It is the thing that
-turns "I think" into "I checked".
+Every probe reaches the ERP **through the Canals ERP proxy**
+(`/erp-proxy/{orgId}/{erpType}/<path>`). The proxy owns the real ERP credentials
+and its permission checks stay authoritative.
 
-## Where the conventions live
+## Retired: do not write these
 
-`~/repositories/canals` is the app; the probes live in
-`/mnt/personal/planning/canals-inventory-network/` — ~78 of them, named
-`<erp>_probe_<question>.sh` (`eclipse_probe_interim_status.sh`,
-`p21_probe_price_override_authority.sh`, `infor_probe_create_product.sh`).
+- **No decrypting an org's ERP secret and using it locally.** That is no longer
+  supported. No `pnpm cli decrypt`, no `decrypt_value`, no `target_row()` with baked
+  ciphertext, no `PLAINPASS_<inst>`, no `--enc-pass`, no `CANALS_REPO` for decrypting.
+- **No Pritunl.** No `PROXY_SANDBOX=http://sandbox-pritunl:8888` or any
+  `PROXY_*` tunnel variable. Don't hit an ERP host directly.
+- The old `<erp>_probe_<question>.sh` scripts that do this are legacy. Don't copy
+  their auth. Their *questions* and header prose are still good reference.
 
-**Read the most recent probe for the same ERP before writing anything** and copy
-its shape. Don't invent a new one; these are heavily converged and the user asks
-for "like the others" every single time.
+## Pick the transport (say which you picked, and why)
 
-## Non-negotiables
+| Target | Transport | Notes |
+| --- | --- | --- |
+| Production, or any org | **Chrome console script** | The only option for production. |
+| Sandbox | Chrome console script, **or** the local ERP bridge | The bridge is **sandbox only**. |
 
-- **Pick the credential convention from the audience, and say which you picked.**
-  There are two, and getting it wrong bakes an org's credential into a file that
-  leaves the building.
+Default to the console script. Use the bridge only when the question needs the real
+client code path (Eclipse/P21 client logic, native readers, a local integration run)
+instead of hand-built HTTP calls, and only against sandbox.
 
-  *Internal probe I run myself* (`<erp>_probe_<question>.sh`, 44 of them) —
-  ciphertext embedded in the target table:
+Start from `console-probe-template.js` in this skill's directory
+(`/mnt/personal/dotfiles/claude/skills/erp-probe/`). It already has the origin guard,
+adjustable pacing, 429 handling, status logging, NOT CHECKED output and results
+download, so you only fill in `targets` and the questions. You don't need to read
+other probes to write one.
 
-  ```bash
-  target_row() {   # host|user|encrypted-password|env
-    case "$1" in
-      kendall-sbx)  echo 'https://kg-dev-api.kendallgroup.com|CANALSAI|<enc>|sandbox' ;;
-      kendall-prod) echo 'https://kg-api.kendallgroup.com|CANALSAI|<enc>|production' ;;
-      *) return 1 ;;
-    esac
-  }
-  ```
+Save the probe wherever the work lives (the task's planning directory, or next to the
+code under investigation). There is no required location. Name it
+`<erp>_probe_<topic>_erp_proxy.js`.
 
-  Get the encrypted value from the org record via the read-only `postgres-*` MCP.
-  Keep the `PLAINPASS_<inst>` override.
+## Chrome console script
 
-  *Anything handed to a customer, or run against an org whose keys I don't hold*
-  (`<erp>_verify_customer_setup.sh`) — **no baked ciphertext at all.** Auth, host
-  and proxy all arrive as flags: `--host`, `--user`, `--pass` or `--enc-pass`,
-  `--canals-repo`. `p21_verify_customer_setup.sh:12` states the rule outright.
+The user opens a tab on the right origin in the Chrome profile logged into Canals
+(not impersonating), pastes the script into the console, and sends the downloaded
+results back so you can read them.
 
-- **The decrypt helper must reject the CLI's own failure text.** `pnpm cli decrypt`
-  writes `ELIFECYCLE Command failed` to **stdout**, so a bare `| tail -n1` captures
-  that as the password and a missing `AUTOMATOR_API_KEY` then reports itself as an
-  auth rejection from the ERP. Copy the guard verbatim:
+What the template gives you, and what to keep when you change it:
 
-  ```bash
-  decrypt_value() {   # ciphertext  env
-    local out status
-    out=$( cd "$CANALS_REPO" && pnpm cli decrypt "$1" -e "$2" -r "$DECRYPT_REASON" 2>/dev/null )
-    status=$?
-    [[ $status -ne 0 ]] && return 1
-    out=$(printf '%s' "$out" | tail -n1)
-    [[ -z "$out" || "$out" == *ELIFECYCLE* || "$out" == *"Command failed"* ]] && return 1
-    printf '%s' "$out"
-  }
-  ```
+- One async IIFE. First line guards the origin and throws a clear instruction:
+  `https://api.canals.ai` for production, `https://sandbox.api.canals.ai` for
+  sandbox. Tell the user which `/ping` page to open.
+- Requests go to `${location.origin}/erp-proxy/${orgId}/${erpType}/${path}` with
+  `credentials: 'same-origin'`, `Accept: application/json`, and
+  `signal: AbortSignal.timeout(60000)`.
+- **Pacing:** `window.probePauseMs = 500` by default, read before every request so
+  the user can change it mid-run. Give them the console command
+  (`window.probePauseMs = 1000`) in the final log line.
+- **429:** use the server's actual delay (`retry-after` header, else
+  `data.data.retryAfterSeconds`). Record a shared `cooldownUntil` and wait for it
+  before any later request. No 30-second floor, no invented exponential backoff.
+  If no usable delay comes back, throw and stop. A changed `probePauseMs` never
+  shortens a cooldown.
+- Print the HTTP status of every call. Never hide a 4xx/5xx. `console.table` a
+  summary at the end.
+- **Results go back through a download:** build a `Blob` of
+  `{at, summary, results}`, trigger an `<a download>`, revoke the URL after 10 s.
+  Say the filename in the header and the last log line. The user attaches that file
+  (or pastes the summary) back to you.
+- Read-only: GET, or POST only for read-style calls (for example an
+  `EclipseSubroutine` `ACTION READ`). Anything that writes is opt-in (see below).
+- Parameterise orgs, branches and ids in a `targets` array at the top. No
+  customer-specific logic below it.
+- The script does the whole job. No "now click this in the UI" step.
+- Do not log tokens, cookies, or the Canals key.
 
-- **One paste-ready command, no assembly.** The user runs these on their **Mac**,
-  not in the pod. End with the exact single line to run — real values, no
-  placeholders, nothing to stitch together from two places:
+Hand-over: attach the `.js` file with the `add_attachment` MCP tool, then give the
+user the steps in one short block: open `<origin>/ping`, open DevTools console,
+paste the file contents, wait for the download, send it back.
 
-  ```
-  PROXY_SANDBOX=http://sandbox-pritunl:8888 CANALS_REPO=~/code/canals \
-    bash ~/Downloads/<probe>.sh 2>&1 | tee /tmp/<probe>.log
-  ```
+## Local ERP bridge (sandbox only)
 
-- **Read-only by default; writes are opt-in behind `--apply`.** State the verdict on
-  its own line in the header (`✅ READ-ONLY` or `WRITES`). A write-capable probe
-  defaults to a dry run that prints the exact payload it *would* send, and only
-  `--apply` actually sends it. Close with a banner naming precisely what gets
-  created and on which targets (`⚠️ --apply: this CREATES …` vs
-  `DRY RUN (no --apply): …`). Print created ids so they can be cancelled. Only write
-  when I've asked to exercise a write path.
+For when the probe should exercise a real integration client locally. The bridge is
+a loopback HTTP relay to the sandbox proxy. Design and usage:
+`/mnt/personal/planning/inv-opt-syncs/local-erp-proxy-bridge-plan-20261029.md`
+(branch `codex/local-erp-bridge` in the canals repo, `scripts/local_erp_bridge/`).
 
-- **Never shrink the MANUAL / NOT CHECKED section.** Verify scripts end with a tail
-  listing what could not be checked — no input, or the read it needed was
-  unavailable. That section exists so a run can't look complete when things went
-  unchecked. Don't trim it to make output tidier.
+- ERP base URL becomes `http://erp-bridge.test:18765/erp-proxy/{orgId}/{erpType}`.
+  It binds only to `127.0.0.1`. Hardcoded to `https://sandbox.api.canals.ai`. There
+  is no production or staging mode, so never offer it for production.
+- It needs `CANALS_API_KEY` (an existing user-bound key, from the env or a private
+  prompt). Never paste the key into chat or bake it into a file. ERP credentials
+  are synthetic: login calls get fixed fake responses, and the real ERP auth stays
+  in the proxy.
+- Start it on the Mac from the canals repo root:
+  `pnpm --filter @canals/scripts exec tsx local_erp_bridge/bridge.ts`
+- Local callers run with `NO_PROXY=erp-bridge.test,127.0.0.1,localhost` so the
+  loopback traffic is not sent to an HTTP proxy.
+- The bridge paces itself (one in-flight request per org, 500 ms spacing), relays
+  429 unchanged and holds the org until `Retry-After` expires. It never retries.
+  Don't add retries of your own on top, especially for writes.
+- A client with a hardcoded auth host, or SQL/ODBC/TCP access, can't go through it.
+  Say so rather than promising URL-only compatibility.
+- Live compatibility per client is unproven. State that in the hand-over, and
+  record what actually worked.
 
-- **Both environments.** Support sandbox and production instances via the target
-  table and `TARGETS`, with `PROXY_SANDBOX` / `PROXY_PRODUCTION` / `PROXY`.
+A bridge probe is a script or test command that the user runs on their Mac with the
+one-line start command above. Give the exact full command, as `bash ./script.sh`
+where it is a shell script.
 
-- **It does the whole job itself.** No "now go click this in the UI", no manual
-  step in the middle. If it needs a token, an order, a second line — the probe
-  creates them.
+## Non-negotiables (all transports)
 
-- **macOS *and* Linux.** It runs on the user's laptop, so no GNU-only invocations
-  without a BSD fallback:
-
-  ```bash
-  date -u -d "+${DAYS} days" +%Y-%m-%d 2>/dev/null || date -u -v+"${DAYS}"d +%Y-%m-%d
-  ```
-
-- **No hardcoded org identity in logic.** Instance rows are the one place specifics
-  belong. Keep customer/branch/product as `<VAR>_<inst>` env-overridable defaults.
-
-- `set -euo pipefail`, a `ccurl` wrapper with `--max-time` and the optional proxy,
-  and HTTP status captured and printed for every call — a probe that hides a 400 is
-  worse than no probe.
-
-- **Never name a variable `COLUMNS`.** Bash owns it (terminal width) and clobbers it
-  silently. Use `COLUMNS_OVERRIDE`.
+- **Read-only by default; writes are opt-in.** State the verdict on its own line in
+  the header (`✅ READ-ONLY` or `WRITES`). A write-capable probe defaults to a dry
+  run that prints the exact payload it would send, and only sends it behind an
+  explicit flag (`window.probeApply = true` in the console, `--apply` in a shell
+  script). Close with a banner naming exactly what gets created and on which
+  targets, and print created ids so they can be cancelled. Only write when asked to
+  exercise a write path. The bridge never writes to production because it can't
+  reach it.
+- **Never shrink the NOT CHECKED section.** The probe ends by listing what it could
+  not check (no input, read denied, 401/403, record absent). A run must not look
+  complete when things went unchecked. Missing records and denied reads are
+  "unknown", never zero.
+- **Don't run it against production yourself.** Production probes are handed over
+  and run by the user in their own browser session.
+- **No hardcoded org identity in logic.** Orgs, branches and products are
+  data at the top of the file, overridable.
+- **Never name a variable `COLUMNS`** in shell scripts (bash owns it). Use
+  `COLUMNS_OVERRIDE`.
+- Shell scripts that remain (bridge helpers): `set -euo pipefail`, status printed
+  for every call, macOS and Linux compatible (BSD `date` fallback).
+- **No placeholders in what you hand the user.** Real org ids, real values.
 
 ## The header comment
 
-Copy the existing shape: one line saying what question it answers, then **why it
-exists** (the decision or bug that made the question matter, with PR numbers and
-any live observation), then whether it writes, then `Env:` and `Usage:` blocks.
-This is the one place verbose prose is wanted — it's what makes a probe re-runnable
-in three weeks.
+One line saying what question it answers, then **why it exists** (the decision or
+bug that made the question matter, with PR numbers and any live observation), then
+the read-only/writes verdict, then usage and the output filename. This is the one
+place verbose prose is wanted: it is what makes a probe re-runnable in three weeks.
+No narrating of how the probe was verified, no dates or cross-references to docs.
 
 ## Steps
 
-- Pin down the question. One probe, one question — if there are three, say so and
-  ask whether to write three.
-- Read the newest probe for that ERP and reuse its helpers verbatim.
-- Look up the instance's host/user/encrypted-password from the org record via the
-  read-only `postgres-*` MCP for the right environment.
-- Write the script into `/mnt/personal/planning/canals-inventory-network/`
-  (durable — the pod is not).
-- **Attach it** with the `add_attachment` MCP tool so it can be downloaded, then
-  print the single run command.
-- After the user pastes results back: record the findings in the relevant planning
-  doc, and keep the probe's own commentary out of anything customer- or
-  channel-facing.
+1. List every question the task raises. Cover as many as possible in **one** probe
+   run (a section per question, all targets and controls in the same script) so the
+   user pastes once and sends back one file. Don't split into several probes, and
+   don't ask which to write. The user should not be a manual proxy for your
+   follow-up queries. Anticipate the next call you would make (neighbouring
+   endpoints, control records, the other branches or orgs) and include it now.
+2. If the DB or the code can answer a question, answer it yourself and leave it out
+   of the probe.
+3. Pick the transport from the table above and say which.
+4. Copy `console-probe-template.js` and fill it in.
+5. Write it somewhere durable (the pod is not), e.g. the work's planning directory.
+6. Attach it with `add_attachment`, and give the hand-over steps for that transport.
+7. When the user sends results back: read them, state what they show and what they
+   don't, and record the findings in the relevant planning doc in the same turn.
+   Keep the probe's own commentary out of anything customer- or channel-facing.
+8. Update this skill (see below) with anything from this probe that a future probe
+   would need.
 
-## Constraints
+## Keep this skill current
 
-- Don't run it against production yourself. These are handed over and run locally.
-- Never print a decrypted password, and never echo the plaintext into the log.
-- If the question can be answered from the DB or the code, say so instead of
-  writing a probe.
+This skill lives in the user's personal dotfiles
+(`/mnt/personal/dotfiles/claude/skills/erp-probe/`, symlinked from
+`~/.claude/skills/erp-probe`). Edit it directly whenever a probe teaches something
+reusable. Don't ask first, and don't wait to be told. Tell the user in your reply
+what you changed.
+
+Worth recording:
+
+- A correction from the user about how probes should work. Update the rule it
+  contradicts, and don't just add a new line beside it.
+- Proxy behaviour seen in a real run: which endpoints the proxy rejects or
+  classifies differently, error shapes, how a 429 actually arrived, and auth or
+  permission failures and what fixed them.
+- ERP endpoint facts a probe confirmed: the working path and query shape,
+  pagination limits, ids that need special encoding, fields that come back as a
+  different type than the code assumes. Group them under a per-ERP heading in an
+  `## ERP notes` section at the end of this file.
+- Bridge compatibility per client: what worked through it, and what needed an
+  auth-host override or couldn't go through at all.
+- A helper you had to write that the next probe will want. Put it in
+  `console-probe-template.js` instead of describing it here.
+
+Not worth recording: org-specific ids, customer names, one-off results, or anything
+that belongs in a planning doc. Keep tenant names out of the skill. Edit with the
+Edit tool, keep it terse, and remove or fix anything that turned out to be wrong.
+Don't commit or push the dotfiles repo unless the user asks.
