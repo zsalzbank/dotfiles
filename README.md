@@ -288,8 +288,10 @@ weeks.
 
 ## Notification triage (`bin/gh-triage`)
 
-A searchable list of the GitHub notification inbox. The web UI can't search
-notification titles, which is what makes a few hundred unread unworkable.
+A searchable list of the GitHub notification inbox, read and unread but not
+done (`all=true&is_done=false`; `all=true` alone also returns every thread ever
+marked done). The web UI can't search notification titles, which is what makes a
+few hundred unread unworkable. `clean` only looks at unread ones.
 
 ```sh
 gh-triage                    # the TUI
@@ -305,6 +307,8 @@ gh-triage clean --apply      # skip the question (scripts, cron)
 | `space` | check the row |
 | `v` `a` `x` | check what's on screen / everything the filter shows / nothing |
 | `c` | check everything `clean` would sweep |
+| `s` | edit the extra searches that make a notification cleanable |
+| `ctrl+s` | add the current filter text to those searches, after a confirm |
 | `o` | open the checked PRs in browser tabs |
 | `d` `u` | mark done / unsubscribe (both confirm first) |
 | `r` `q` | reload the inbox / quit |
@@ -337,6 +341,16 @@ without merging, or not a PR at all (check failures and the like). Merged PRs ar
 left alone. Before acting it re-checks the affected PRs against the API, so a
 cached plan can never mark done something that has since reopened. `c` is the
 same rule applied to the current view.
+
+`s` opens a box for extra searches, one per line, saved to `clean-searches.txt`
+in `~/.local/share/gh-triage` (the persistent share in a devspaces pod). A notification whose title, repo or number contains a line
+(any case, the whole line as one substring) counts as cleanable whatever its PR
+state, so it is swept by `c` and by `clean` alike. `ctrl+s` saves, `escape`
+cancels. Repeats in any case are dropped.
+
+`ctrl+s` from the list or the filter box adds what is typed there as one new line,
+after showing it and how many notifications match. `author:`, `repo:` and
+`status:` filters are refused, since a saved search only matches text.
 
 `o` hands the urls to the platform opener, so run it where your browser is; in a
 remote workspace there is no browser to open and it prints them instead.

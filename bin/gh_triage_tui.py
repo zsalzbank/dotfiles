@@ -14,11 +14,12 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Input, Label, Static
+from textual.widgets import Button, DataTable, Footer, Input, Label, Static, TextArea
 
-from gh_triage import (LOG, act_on_threads, build_items, clean_reason, decision,
-                       fetch_prs, get_notifications, log_records, open_urls,
-                       pr_author, pr_status)
+from gh_triage import (CLEAN_TERMS, LOG, act_on_threads, build_items, clean_reason,
+                       decision, fetch_prs, get_notifications, haystack, log_records,
+                       matches_clean_search, open_urls, pr_author, pr_status,
+                       set_clean_searches)
 
 COLUMNS = ("", "repo", "pr", "age", "author", "status", "title")
 
@@ -59,7 +60,7 @@ def matches(item, terms):
                     return False
                 break
         else:
-            if t not in f"{item.title} {item.repo} {item.number}".lower():
+            if t not in haystack(item):
                 return False
     return True
 
@@ -96,6 +97,46 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class CleanSearches(ModalScreen[str | None]):
+    """Multiline editor for the extra searches that make a notification cleanable.
+
+    Dismisses with the raw text on save, or None on cancel.
+    """
+
+    BINDINGS = [
+        Binding("ctrl+s", "save", "save"),
+        Binding("escape", "cancel", "cancel"),
+    ]
+
+    def __init__(self, searches) -> None:
+        super().__init__()
+        self.searches = list(searches)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Also treat as cleanable", id="question")
+            yield Static("One search per line. A notification whose title, repo or "
+                         "number contains a line (any case) counts as cleanable for "
+                         "`c` and `gh-triage clean`, whatever its PR state.",
+                         id="detail")
+            yield TextArea("\n".join(self.searches), id="searches")
+            with Horizontal(id="buttons"):
+                yield Button("save  (ctrl+s)", variant="primary", id="save")
+                yield Button("cancel  (esc)", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one(TextArea).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(self.query_one(TextArea).text if event.button.id == "save" else None)
+
+    def action_save(self) -> None:
+        self.dismiss(self.query_one(TextArea).text)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class Triage(App):
     CSS = """
     Input { border: none; height: 1; background: $panel; }
@@ -103,11 +144,13 @@ class Triage(App):
     #status { height: 1; color: $text-muted; padding-left: 1; }
     #status.warn { color: $warning; text-style: bold; }
     DataTable { height: 1fr; }
-    Confirm { align: center middle; }
+    Confirm, CleanSearches { align: center middle; }
     #dialog {
         width: 84; height: auto; padding: 1 2;
         border: thick $error; background: $surface;
     }
+    CleanSearches #dialog { border: thick $primary; }
+    #searches { height: 10; margin-top: 1; }
     #question { text-style: bold; width: 100%; }
     #detail { color: $text-muted; margin-top: 1; height: auto; max-height: 12; }
     #buttons { margin-top: 1; height: auto; align: center middle; }
@@ -121,6 +164,8 @@ class Triage(App):
         Binding("v", "select_on_screen", "on screen"),
         Binding("x", "clear_selection", "none"),
         Binding("c", "select_cleanable", "cleanable"),
+        Binding("s", "edit_clean_searches", "cleanable searches"),
+        Binding("ctrl+s", "save_search", "save search as cleanable"),
         Binding("o", "open", "open"),
         Binding("d", "mark_done", "done"),
         Binding("u", "unsubscribe", "unsub"),
@@ -341,6 +386,43 @@ class Triage(App):
             self.origin.setdefault(i.thread_id, "cleanable")
         self.refresh_rows()
 
+    def action_edit_clean_searches(self) -> None:
+        self.push_screen(CleanSearches(CLEAN_TERMS), self._clean_searches_edited)
+
+    def action_save_search(self) -> None:
+        """Offer the current filter box text as a saved search, after a confirm."""
+        query = self.query_one(Input).value.strip()
+        if not query:
+            self.notify("type a search first")
+            return
+        if any(w.startswith(p) for w in query.lower().split() for p in FIELDS):
+            self.notify("saved searches match title, repo or number text, so "
+                        f"{'/'.join(FIELDS)} filters can't be saved", severity="warning")
+            return
+        if query.lower() in {t.lower() for t in CLEAN_TERMS}:
+            self.notify("that search is already saved")
+            return
+        hits = sum(1 for i in self.items if query.lower() in haystack(i))
+        self.push_screen(
+            Confirm("Save this search as cleanable?",
+                    f"{query}\n\nmatched as one phrase, any case; {hits} notification"
+                    f"{'s' if hits != 1 else ''} match now. `c` and `gh-triage clean` "
+                    "will then sweep anything containing it."),
+            lambda ok: ok and self._clean_searches_edited(
+                "\n".join([*CLEAN_TERMS, query])))
+
+    def _clean_searches_edited(self, text) -> None:
+        if text is None:
+            return
+        try:
+            set_clean_searches(text)
+        except OSError as e:
+            self.notify(f"could not save searches: {e}", severity="error")
+            return
+        hits = sum(1 for i in self.items if matches_clean_search(i))
+        self.notify(f"saved {len(CLEAN_TERMS)} search{'es' if len(CLEAN_TERMS) != 1 else ''}"
+                    f", {hits} notification{'s' if hits != 1 else ''} match")
+
     # ---------------------------------------------------------------- reload
 
     def action_reload(self) -> None:
@@ -353,7 +435,7 @@ class Triage(App):
     @work(thread=True)
     def reload(self) -> None:
         try:
-            items = build_items(get_notifications())
+            items = build_items(get_notifications(include_read=True))
         except SystemExit as e:  # get_notifications exits on an API error
             self.call_from_thread(self._reload_failed, str(e))
             return
@@ -387,7 +469,7 @@ class Triage(App):
         self._warned_author = False
         self.apply_filter()
         self.enrich()
-        note = f"reloaded: {len(items)} unread"
+        note = f"reloaded: {len(items)} notifications"
         if fresh:
             note += f", {len(fresh)} new"
         if gone:
@@ -543,7 +625,7 @@ def session_record(items, acted, searches, rejected=()):
 
 def run() -> None:
     print("loading notifications...", flush=True)
-    items = build_items(get_notifications())
+    items = build_items(get_notifications(include_read=True))
     if not items:
         print("inbox is empty")
         return

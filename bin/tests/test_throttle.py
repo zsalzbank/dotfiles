@@ -1,6 +1,7 @@
 """Telling a rate limit apart from a permission failure."""
 import time
 
+import gh_triage
 from gh_triage import throttle_delay
 
 PERM = '{"message":"Resource not accessible by integration"}'
@@ -52,3 +53,25 @@ def test_header_lookup_is_case_insensitive():
     m = http.client.HTTPMessage()
     m["Retry-After"] = "9"
     assert throttle_delay(m, 403, SECONDARY, 0) == 9
+
+
+def test_include_read_asks_for_the_inbox_not_the_done_history(monkeypatch):
+    urls = []
+
+    class Empty:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def read(self):
+            return b"[]"
+
+    monkeypatch.setenv("GITHUB_NOTIFICATIONS_PAT", "x")
+    monkeypatch.setattr(gh_triage.urllib.request, "urlopen",
+                        lambda req: urls.append(req.full_url) or Empty())
+    gh_triage.get_notifications()
+    gh_triage.get_notifications(include_read=True)
+    assert "all=true" not in urls[0]
+    assert "all=true&is_done=false" in urls[1]

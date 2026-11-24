@@ -25,7 +25,7 @@ def inbox():
 
 def stub_fetch(monkeypatch, items):
     """Make the next reload return exactly `items`."""
-    monkeypatch.setattr(gh_triage_tui, "get_notifications", lambda: [])
+    monkeypatch.setattr(gh_triage_tui, "get_notifications", lambda **_: [])
     monkeypatch.setattr(gh_triage_tui, "build_items", lambda _: items)
 
 
@@ -124,7 +124,7 @@ async def test_reload_is_refused_while_an_action_is_running(inbox, monkeypatch):
     async with app.run_test(size=SIZE) as pilot:
         called = []
         monkeypatch.setattr(gh_triage_tui, "get_notifications",
-                            lambda: called.append(1) or [])
+                            lambda **_: called.append(1) or [])
         app.busy = True
         await pilot.press("r")
         await pilot.pause(0.2)
@@ -144,7 +144,7 @@ async def test_escape_does_not_claim_to_cancel_a_reload(inbox, monkeypatch):
 
 async def test_a_failed_reload_clears_busy(inbox, monkeypatch):
     """An API error must not leave the ui wedged with every key refused."""
-    def boom():
+    def boom(**_):
         raise SystemExit("notifications API 401")
 
     monkeypatch.setattr(gh_triage_tui, "get_notifications", boom)

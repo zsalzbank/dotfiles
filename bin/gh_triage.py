@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Search, select, and act on GitHub notifications in bulk.
 
-  (no args)   Open the TUI: the whole unread inbox in a list you can search by
-              title, check off, and then act on. The notifications web UI has no
-              title search, which is the whole reason this exists.
+  (no args)   Open the TUI: the whole inbox, read and unread, in a list you can
+              search by title, check off, and then act on. The notifications web
+              UI has no title search, which is the whole reason this exists.
 
   clean       The non-interactive sweep: mark done every unread notification
               that is a draft PR, a PR closed without merging, or not a PR at
-              all. Merged PRs are left alone. Kept as a subcommand so it works
-              in a script and still works if the TUI's venv is broken.
+              all, plus anything matching the searches saved from the TUI.
+              Merged PRs are otherwise left alone. Kept as a subcommand so it
+              works in a script and still works if the TUI's venv is broken.
 
 PR state is cached in ~/.cache/gh-triage/prs.json and only re-fetched when the
 notification's updated_at moves. Delete that file to force a full refresh.
@@ -49,21 +50,23 @@ PR_CACHE_MAX_AGE = 30 * 86400
 PR_FIELDS = 2
 
 
-def _default_log():
-    """Decisions are training data, not cache, so they go under the user data
-    dir rather than the prunable cache path. In a devspaces pod that dir is
-    ephemeral, so the persistent share wins there; GH_TRIAGE_LOG overrides both,
-    which is how a pod and a laptop can append to the same file.
+def _data_dir():
+    """Anything worth keeping goes under the user data dir rather than the
+    prunable cache path. In a devspaces pod that dir is ephemeral, so the
+    persistent share wins there.
     """
     personal = Path("/mnt/personal")
     if os.environ.get("DEVSPACES_WORKSPACE_ID") and personal.is_dir():
         base = personal
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-    return base / "gh-triage" / "actions.jsonl"
+    return base / "gh-triage"
 
 
-LOG = Path(os.environ.get("GH_TRIAGE_LOG") or _default_log())
+# Decisions are training data. GH_TRIAGE_LOG overrides the location, which is
+# how a pod and a laptop can append to the same file.
+LOG = Path(os.environ.get("GH_TRIAGE_LOG") or _data_dir() / "actions.jsonl")
+CLEAN_SEARCHES = _data_dir() / "clean-searches.txt"
 
 # GitHub asks for serial mutations a second apart, which is ten minutes for a
 # full inbox. A small pool with real backoff is the compromise: fast enough to
@@ -91,11 +94,17 @@ def _auth(extra=None):
     return h
 
 
-def get_notifications():
+def get_notifications(include_read=False):
+    """Unread notifications, or with include_read every one still in the inbox.
+
+    all=true alone also returns threads marked done, which is most of a
+    long-lived account's history; is_done=false is what keeps it to the inbox.
+    """
     out, page = [], 1
     while page <= 40:
         req = urllib.request.Request(
-            f"{API}/notifications?per_page=100&page={page}", headers=_auth())
+            f"{API}/notifications?per_page=100&page={page}"
+            + ("&all=true&is_done=false" if include_read else ""), headers=_auth())
         try:
             with urllib.request.urlopen(req) as r:
                 batch = json.load(r)
@@ -345,16 +354,61 @@ def pr_status(item, pr):
 CLEANABLE = {"other", "draft", "closed"}
 
 
+def haystack(item):
+    """The text a plain search term is tested against."""
+    return f"{item.title} {item.repo} {item.number}".lower()
+
+
+def _search_lines(text):
+    """One search per line; blanks and repeats (in any case) carry no meaning."""
+    seen, lines = set(), []
+    for l in (l.strip() for l in text.splitlines()):
+        if l and l.lower() not in seen:
+            seen.add(l.lower())
+            lines.append(l)
+    return lines
+
+
+def _load_clean_searches():
+    try:
+        return _search_lines(CLEAN_SEARCHES.read_text())
+    except OSError:
+        return []
+
+
+# Shared by the TUI and `clean`, so `c` and the sweep cannot disagree. Mutated
+# in place so a name imported from here keeps seeing the current searches.
+CLEAN_TERMS = _load_clean_searches()
+
+
+def set_clean_searches(text):
+    """Persist the searches and make them live. Raises OSError if unwritable."""
+    lines = _search_lines(text)
+    CLEAN_SEARCHES.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLEAN_SEARCHES.with_suffix(".tmp")
+    tmp.write_text("".join(f"{l}\n" for l in lines))
+    tmp.replace(CLEAN_SEARCHES)
+    CLEAN_TERMS[:] = lines
+
+
+def matches_clean_search(item):
+    """Any saved search appearing in the title, repo or number, ignoring case."""
+    text = haystack(item)
+    return any(t.lower() in text for t in CLEAN_TERMS)
+
+
 def clean_reason(item, pr):
     """Why `clean` would sweep this, or None to leave it alone.
 
     Merged and open PRs are deliberately excluded: that work landed, or is live.
+    The saved searches are the one way past that, because they are a decision
+    about specific text rather than a guess from state.
     Derived from pr_status so the status column and the sweep cannot disagree.
     """
     status = pr_status(item, pr)
-    if status not in CLEANABLE:
-        return None
-    return item.subject_type if status == "other" else status
+    if status in CLEANABLE:
+        return item.subject_type if status == "other" else status
+    return "search" if matches_clean_search(item) else None
 
 
 # ---------------------------------------------------------------- actions
