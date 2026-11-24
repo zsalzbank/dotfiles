@@ -9,12 +9,13 @@ sys.path.insert(0, "/mnt/personal/hooks/lib")
 import hooklib  # noqa: E402
 
 
-def conflict_message(repo: str, num: str, url: str) -> str | None:
+def conflict_notification(repo: str, num: str, url: str) -> tuple[str, str] | None:
+    """(episode signature, message), or None for a closed PR."""
     notification = f"A hook detected a merge conflict on {repo}#{num} ({url}). "
     try:
         result = subprocess.run(
             ["gh", "api", f"repos/{repo}/pulls/{num}", "--jq",
-             "{state,head:.head.ref,base:.base.ref,default:.base.repo.default_branch}"],
+             "{state,sha:.head.sha,head:.head.ref,base:.base.ref,default:.base.repo.default_branch}"],
             capture_output=True,
             text=True,
             check=True,
@@ -25,11 +26,12 @@ def conflict_message(repo: str, num: str, url: str) -> str | None:
             raise ValueError("PR metadata is not an object")
         if pr.get("state") == "closed":
             return None
-        head, base, default = pr.get("head"), pr.get("base"), pr.get("default")
-        if pr.get("state") != "open" or not all(isinstance(value, str) and value for value in (head, base, default)):
+        sha, head, base, default = pr.get("sha"), pr.get("head"), pr.get("base"), pr.get("default")
+        if pr.get("state") != "open" or not all(isinstance(value, str) and value for value in (sha, head, base, default)):
             raise ValueError("PR head/base metadata is missing")
+        signature = f"{sha}:{base}"
         if base == default:
-            return (
+            return signature, (
                 f"{hooklib.skill('canals:merge-master')} {repo}#{num} "
                 f"(hook: head {head} has a merge conflict with its default-branch base {base} — {url}). "
                 f"Work only on this PR's head {head}. Re-read its current head, base, and repository default branch "
@@ -38,8 +40,9 @@ def conflict_message(repo: str, num: str, url: str) -> str | None:
             )
         notification += f"This is a stacked PR: {head} targets {base}, not the default branch {default}. "
     except (subprocess.SubprocessError, OSError, ValueError):
+        signature = "unverified"
         notification += "Its current head/base could not be verified. "
-    return (
+    return signature, (
         notification + "Notify the user and wait for their explicit request before invoking a merge workflow "
         "or making Git/PR changes in response to this notification."
     )
@@ -50,12 +53,11 @@ if hooklib.is_terminal(payload):
     sys.exit(0)
 
 repo, num, url = hooklib.ref(payload)
-key = f"merge-conflict-{repo}#{num}"
 
+# GitHub reports `mergeable` as UNKNOWN while it recomputes after the base moves, which the payload
+# flattens to conflict=false. Clearing the episode on that would re-notify the same conflict, so the
+# episode is keyed on head commit and base instead: only a new push or a retarget notifies again.
 if hooklib.current(payload).get("conflict") is True:
-    if hooklib.episode_guard(key, "conflict"):
-        message = conflict_message(repo, num, url)
-        if message:
-            hooklib.inject("merge-conflict", message)
-else:
-    hooklib.episode_clear(key)
+    notification = conflict_notification(repo, num, url)
+    if notification and hooklib.episode_guard(f"merge-conflict-{repo}#{num}", notification[0]):
+        hooklib.inject("merge-conflict", notification[1])

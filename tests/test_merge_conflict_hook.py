@@ -34,14 +34,14 @@ class MergeConflictHookTests(unittest.TestCase):
     def test_default_branch_conflict_automatically_invokes_merge_workflow(self):
         for base in ("main", "master"):
             with self.subTest(base=base):
-                hooklib, _ = self.run_hook({"state": "open", "head": "feature", "base": base, "default": base})
+                hooklib, _ = self.run_hook({"state": "open", "sha": "abc", "head": "feature", "base": base, "default": base})
                 message = hooklib.inject.call_args.args[1]
                 self.assertIn("$canals:merge-master Example/repo#123", message)
                 self.assertIn(f"default-branch base {base}", message)
                 self.assertIn("Re-read its current head, base", message)
 
     def test_stacked_conflict_waits_without_invoking_a_merge_workflow(self):
-        hooklib, _ = self.run_hook({"state": "open", "head": "child", "base": "parent", "default": "master"})
+        hooklib, _ = self.run_hook({"state": "open", "sha": "abc", "head": "child", "base": "parent", "default": "master"})
         message = hooklib.inject.call_args.args[1]
         self.assertIn("child targets parent", message)
         self.assertIn("wait for their explicit request", message)
@@ -54,7 +54,7 @@ class MergeConflictHookTests(unittest.TestCase):
         hooklib.skill.assert_not_called()
 
     def test_missing_default_branch_does_not_merge(self):
-        hooklib, _ = self.run_hook({"state": "open", "head": "feature", "base": "master"})
+        hooklib, _ = self.run_hook({"state": "open", "sha": "abc", "head": "feature", "base": "master"})
         self.assertIn("could not be verified", hooklib.inject.call_args.args[1])
         hooklib.skill.assert_not_called()
 
@@ -63,15 +63,18 @@ class MergeConflictHookTests(unittest.TestCase):
         hooklib.inject.assert_not_called()
         hooklib.skill.assert_not_called()
 
-    def test_cleared_conflict_clears_episode_without_querying_github(self):
+    def test_episode_is_keyed_on_head_sha_and_base(self):
+        hooklib, _ = self.run_hook({"state": "open", "sha": "abc", "head": "feature", "base": "master", "default": "master"})
+        hooklib.episode_guard.assert_called_once_with("merge-conflict-Example/repo#123", "abc:master")
+
+    def test_conflict_reported_false_keeps_episode_and_skips_github(self):
         hooklib, query = self.run_hook(conflict=False)
         query.assert_not_called()
         hooklib.inject.assert_not_called()
-        hooklib.episode_clear.assert_called_once_with("merge-conflict-Example/repo#123")
+        hooklib.episode_clear.assert_not_called()
 
-    def test_repeated_episode_does_not_inject_again(self):
-        hooklib, query = self.run_hook(episode=False)
-        query.assert_not_called()
+    def test_already_notified_head_does_not_inject_again(self):
+        hooklib, _ = self.run_hook({"state": "open", "sha": "abc", "head": "feature", "base": "master", "default": "master"}, episode=False)
         hooklib.inject.assert_not_called()
 
 
