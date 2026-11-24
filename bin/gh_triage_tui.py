@@ -16,10 +16,10 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Input, Label, Static, TextArea
 
-from gh_triage import (CLEAN_TERMS, LOG, act_on_threads, build_items, clean_reason,
+from gh_triage import (LOG, SAVED_SEARCHES, act_on_threads, build_items, clean_reason,
                        decision, fetch_prs, get_notifications, haystack, log_records,
-                       matches_clean_search, open_urls, pr_author, pr_status,
-                       set_clean_searches)
+                       matches_saved_search, open_urls, pr_author, pr_status,
+                       set_saved_searches)
 
 COLUMNS = ("", "repo", "pr", "age", "author", "status", "title")
 
@@ -97,8 +97,8 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class CleanSearches(ModalScreen[str | None]):
-    """Multiline editor for the extra searches that make a notification cleanable.
+class SavedSearches(ModalScreen[str | None]):
+    """Multiline editor for the searches `m` selects.
 
     Dismisses with the raw text on save, or None on cancel.
     """
@@ -114,10 +114,10 @@ class CleanSearches(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Also treat as cleanable", id="question")
-            yield Static("One search per line. A notification whose title, repo or "
-                         "number contains a line (any case) counts as cleanable for "
-                         "`c` and `gh-triage clean`, whatever its PR state.",
+            yield Label("Saved searches", id="question")
+            yield Static("One search per line. `m` checks every notification whose "
+                         "title, repo or number contains a line (any case), whatever "
+                         "its PR state, so you can mark them done or unsubscribe.",
                          id="detail")
             yield TextArea("\n".join(self.searches), id="searches")
             with Horizontal(id="buttons"):
@@ -144,12 +144,12 @@ class Triage(App):
     #status { height: 1; color: $text-muted; padding-left: 1; }
     #status.warn { color: $warning; text-style: bold; }
     DataTable { height: 1fr; }
-    Confirm, CleanSearches { align: center middle; }
+    Confirm, SavedSearches { align: center middle; }
     #dialog {
         width: 84; height: auto; padding: 1 2;
         border: thick $error; background: $surface;
     }
-    CleanSearches #dialog { border: thick $primary; }
+    SavedSearches #dialog { border: thick $primary; }
     #searches { height: 10; margin-top: 1; }
     #question { text-style: bold; width: 100%; }
     #detail { color: $text-muted; margin-top: 1; height: auto; max-height: 12; }
@@ -164,8 +164,9 @@ class Triage(App):
         Binding("v", "select_on_screen", "on screen"),
         Binding("x", "clear_selection", "none"),
         Binding("c", "select_cleanable", "cleanable"),
-        Binding("s", "edit_clean_searches", "cleanable searches"),
-        Binding("ctrl+s", "save_search", "save search as cleanable"),
+        Binding("m", "select_saved", "saved matches"),
+        Binding("s", "edit_saved_searches", "saved searches"),
+        Binding("ctrl+s", "save_search", "save search"),
         Binding("o", "open", "open"),
         Binding("d", "mark_done", "done"),
         Binding("u", "unsubscribe", "unsub"),
@@ -386,8 +387,22 @@ class Triage(App):
             self.origin.setdefault(i.thread_id, "cleanable")
         self.refresh_rows()
 
-    def action_edit_clean_searches(self) -> None:
-        self.push_screen(CleanSearches(CLEAN_TERMS), self._clean_searches_edited)
+    def action_select_saved(self) -> None:
+        if not SAVED_SEARCHES:
+            self.notify("no saved searches; `s` adds some")
+            return
+        hits = [i for i in self.shown if matches_saved_search(i)]
+        if not hits:
+            self.notify("nothing in the current view matches a saved search")
+            return
+        for i in hits:
+            self.selected.add(i.thread_id)
+            self.origin.setdefault(i.thread_id, "saved-search")
+        self.refresh_rows()
+        self.notify(f"checked {len(hits)} matching a saved search")
+
+    def action_edit_saved_searches(self) -> None:
+        self.push_screen(SavedSearches(SAVED_SEARCHES), self._saved_searches_edited)
 
     def action_save_search(self) -> None:
         """Offer the current filter box text as a saved search, after a confirm."""
@@ -399,28 +414,28 @@ class Triage(App):
             self.notify("saved searches match title, repo or number text, so "
                         f"{'/'.join(FIELDS)} filters can't be saved", severity="warning")
             return
-        if query.lower() in {t.lower() for t in CLEAN_TERMS}:
+        if query.lower() in {t.lower() for t in SAVED_SEARCHES}:
             self.notify("that search is already saved")
             return
         hits = sum(1 for i in self.items if query.lower() in haystack(i))
         self.push_screen(
-            Confirm("Save this search as cleanable?",
+            Confirm("Save this search?",
                     f"{query}\n\nmatched as one phrase, any case; {hits} notification"
-                    f"{'s' if hits != 1 else ''} match now. `c` and `gh-triage clean` "
-                    "will then sweep anything containing it."),
-            lambda ok: ok and self._clean_searches_edited(
-                "\n".join([*CLEAN_TERMS, query])))
+                    f"{'s' if hits != 1 else ''} match now. `m` checks everything "
+                    "containing it."),
+            lambda ok: ok and self._saved_searches_edited(
+                "\n".join([*SAVED_SEARCHES, query])))
 
-    def _clean_searches_edited(self, text) -> None:
+    def _saved_searches_edited(self, text) -> None:
         if text is None:
             return
         try:
-            set_clean_searches(text)
+            set_saved_searches(text)
         except OSError as e:
             self.notify(f"could not save searches: {e}", severity="error")
             return
-        hits = sum(1 for i in self.items if matches_clean_search(i))
-        self.notify(f"saved {len(CLEAN_TERMS)} search{'es' if len(CLEAN_TERMS) != 1 else ''}"
+        hits = sum(1 for i in self.items if matches_saved_search(i))
+        self.notify(f"saved {len(SAVED_SEARCHES)} search{'es' if len(SAVED_SEARCHES) != 1 else ''}"
                     f", {hits} notification{'s' if hits != 1 else ''} match")
 
     # ---------------------------------------------------------------- reload

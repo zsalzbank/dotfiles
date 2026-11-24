@@ -307,8 +307,9 @@ gh-triage clean --apply      # skip the question (scripts, cron)
 | `space` | check the row |
 | `v` `a` `x` | check what's on screen / everything the filter shows / nothing |
 | `c` | check everything `clean` would sweep |
-| `s` | edit the extra searches that make a notification cleanable |
-| `ctrl+s` | add the current filter text to those searches, after a confirm |
+| `m` | check everything matching a saved search |
+| `s` | edit the saved searches |
+| `ctrl+s` | add the current filter text to the saved searches, after a confirm |
 | `o` | open the checked PRs in browser tabs |
 | `d` `u` | mark done / unsubscribe (both confirm first) |
 | `r` `q` | reload the inbox / quit |
@@ -342,11 +343,12 @@ left alone. Before acting it re-checks the affected PRs against the API, so a
 cached plan can never mark done something that has since reopened. `c` is the
 same rule applied to the current view.
 
-`s` opens a box for extra searches, one per line, saved to `clean-searches.txt`
-in `~/.local/share/gh-triage` (the persistent share in a devspaces pod). A notification whose title, repo or number contains a line
-(any case, the whole line as one substring) counts as cleanable whatever its PR
-state, so it is swept by `c` and by `clean` alike. `ctrl+s` saves, `escape`
-cancels. Repeats in any case are dropped.
+`s` opens a box for saved searches, one per line, kept in `saved-searches.txt`
+in `~/.local/share/gh-triage` (the persistent share in a devspaces pod). They are
+separate from what `c` and `clean` sweep: `m` checks every notification whose
+title, repo or number contains a line (any case, the whole line as one
+substring), whatever its PR state, and then `d` or `u` marks them done or
+unsubscribes. `ctrl+s` saves, `escape` cancels. Repeats in any case are dropped.
 
 `ctrl+s` from the list or the filter box adds what is typed there as one new line,
 after showing it and how many notifications match. `author:`, `repo:` and

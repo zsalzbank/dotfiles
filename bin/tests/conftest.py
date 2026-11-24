@@ -53,14 +53,14 @@ def log_path():
 
 
 @pytest.fixture(autouse=True)
-def isolated_clean_searches(tmp_path, monkeypatch):
+def isolated_saved_searches(tmp_path, monkeypatch):
     """Neither read nor write the real saved searches; the list is cleared in
     place because the tui holds a reference to the same object."""
-    monkeypatch.setattr(gh_triage, "CLEAN_SEARCHES", tmp_path / "clean-searches.txt")
-    saved = list(gh_triage.CLEAN_TERMS)
-    gh_triage.CLEAN_TERMS[:] = []
+    monkeypatch.setattr(gh_triage, "SAVED_SEARCHES_FILE", tmp_path / "saved-searches.txt")
+    saved = list(gh_triage.SAVED_SEARCHES)
+    gh_triage.SAVED_SEARCHES[:] = []
     yield
-    gh_triage.CLEAN_TERMS[:] = saved
+    gh_triage.SAVED_SEARCHES[:] = saved
 
 
 @pytest.fixture(autouse=True)

@@ -3,8 +3,8 @@ from conftest import FakeItem
 from textual.widgets import Input, TextArea
 
 import gh_triage
-from gh_triage import CLEANABLE, clean_reason, pr_status, set_clean_searches
-from gh_triage_tui import STATUS_STYLE, CleanSearches, Confirm, Triage, matches
+from gh_triage import CLEANABLE, clean_reason, pr_status, set_saved_searches
+from gh_triage_tui import STATUS_STYLE, Confirm, SavedSearches, Triage, matches
 
 PR = FakeItem(number=1)
 CHECK = FakeItem(number=2, subject_type="CheckSuite")
@@ -62,23 +62,27 @@ def test_clean_leaves_an_unenriched_pr_alone():
     assert clean_reason(PR, None) is None
 
 
-def test_a_saved_search_makes_merged_and_open_prs_cleanable():
-    set_clean_searches("bump provider")
+def test_a_saved_search_does_not_make_a_merged_pr_cleanable():
+    set_saved_searches("bump provider")
     bump = FakeItem(number=5, title="chore(tf): Bump Provider")
-    assert clean_reason(bump, {"state": "MERGED", "isDraft": False}) == "search"
-    assert clean_reason(bump, {"state": "OPEN", "isDraft": False}) == "search"
-    assert clean_reason(bump, None) == "search"
-
-
-def test_a_saved_search_leaves_other_prs_alone():
-    set_clean_searches("bump provider")
-    assert clean_reason(PR, {"state": "OPEN", "isDraft": False}) is None
+    assert clean_reason(bump, {"state": "MERGED", "isDraft": False}) is None
 
 
 def test_saved_searches_survive_a_restart_without_blanks_or_repeats(tmp_path):
-    set_clean_searches("  one \n\n two\none\nONE\n")
-    assert gh_triage.CLEAN_SEARCHES.read_text() == "one\ntwo\n"
-    assert gh_triage._load_clean_searches() == ["one", "two"]
+    set_saved_searches("  one \n\n two\none\nONE\n")
+    assert gh_triage.SAVED_SEARCHES_FILE.read_text() == "one\ntwo\n"
+    assert gh_triage._load_saved_searches() == ["one", "two"]
+
+
+async def test_m_checks_only_notifications_matching_a_saved_search(monkeypatch):
+    monkeypatch.setattr(Triage, "enrich", lambda self: None)
+    set_saved_searches("bump")
+    hit, miss = FakeItem(number=1, title="Bump a"), FakeItem(number=2, title="real")
+    app = Triage([hit, miss])
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("m")
+        assert app.selected == {hit.thread_id}
+        assert app.origin == {hit.thread_id: "saved-search"}
 
 
 async def test_the_dialog_saves_one_search_per_line(monkeypatch):
@@ -89,8 +93,8 @@ async def test_the_dialog_saves_one_search_per_line(monkeypatch):
         app.screen.query_one(TextArea).text = "bump\n\nother"
         await pilot.press("ctrl+s")
         await pilot.pause()
-        assert gh_triage.CLEAN_TERMS == ["bump", "other"]
-        assert not isinstance(app.screen, CleanSearches)
+        assert gh_triage.SAVED_SEARCHES == ["bump", "other"]
+        assert not isinstance(app.screen, SavedSearches)
 
 
 def test_cleanable_set_matches_the_status_vocabulary():
@@ -122,15 +126,15 @@ async def test_ctrl_s_saves_the_active_search_only_after_confirming(monkeypatch)
         await pilot.press("ctrl+s")
         await pilot.pause()
         assert isinstance(app.screen, Confirm)
-        assert gh_triage.CLEAN_TERMS == []
+        assert gh_triage.SAVED_SEARCHES == []
         await pilot.press("y")
         await pilot.pause()
-        assert gh_triage.CLEAN_TERMS == ["Bump"]
+        assert gh_triage.SAVED_SEARCHES == ["Bump"]
 
 
 async def test_ctrl_s_declined_or_already_saved_or_scoped_saves_nothing(monkeypatch):
     monkeypatch.setattr(Triage, "enrich", lambda self: None)
-    set_clean_searches("bump")
+    set_saved_searches("bump")
     app = Triage([FakeItem(number=1, title="bump a")])
     async with app.run_test(size=(120, 40)) as pilot:
         app.query_one(Input).value = "other"
@@ -143,4 +147,4 @@ async def test_ctrl_s_declined_or_already_saved_or_scoped_saves_nothing(monkeypa
             await pilot.press("ctrl+s")
             await pilot.pause()
             assert not isinstance(app.screen, Confirm)
-        assert gh_triage.CLEAN_TERMS == ["bump"]
+        assert gh_triage.SAVED_SEARCHES == ["bump"]

@@ -7,9 +7,8 @@
 
   clean       The non-interactive sweep: mark done every unread notification
               that is a draft PR, a PR closed without merging, or not a PR at
-              all, plus anything matching the searches saved from the TUI.
-              Merged PRs are otherwise left alone. Kept as a subcommand so it
-              works in a script and still works if the TUI's venv is broken.
+              all. Merged PRs are left alone. Kept as a subcommand so it works
+              in a script and still works if the TUI's venv is broken.
 
 PR state is cached in ~/.cache/gh-triage/prs.json and only re-fetched when the
 notification's updated_at moves. Delete that file to force a full refresh.
@@ -66,7 +65,7 @@ def _data_dir():
 # Decisions are training data. GH_TRIAGE_LOG overrides the location, which is
 # how a pod and a laptop can append to the same file.
 LOG = Path(os.environ.get("GH_TRIAGE_LOG") or _data_dir() / "actions.jsonl")
-CLEAN_SEARCHES = _data_dir() / "clean-searches.txt"
+SAVED_SEARCHES_FILE = _data_dir() / "saved-searches.txt"
 
 # GitHub asks for serial mutations a second apart, which is ten minutes for a
 # full inbox. A small pool with real backoff is the compromise: fast enough to
@@ -369,46 +368,43 @@ def _search_lines(text):
     return lines
 
 
-def _load_clean_searches():
+def _load_saved_searches():
     try:
-        return _search_lines(CLEAN_SEARCHES.read_text())
+        return _search_lines(SAVED_SEARCHES_FILE.read_text())
     except OSError:
         return []
 
 
-# Shared by the TUI and `clean`, so `c` and the sweep cannot disagree. Mutated
-# in place so a name imported from here keeps seeing the current searches.
-CLEAN_TERMS = _load_clean_searches()
+# Mutated in place so a name imported from here keeps seeing the current searches.
+SAVED_SEARCHES = _load_saved_searches()
 
 
-def set_clean_searches(text):
+def set_saved_searches(text):
     """Persist the searches and make them live. Raises OSError if unwritable."""
     lines = _search_lines(text)
-    CLEAN_SEARCHES.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CLEAN_SEARCHES.with_suffix(".tmp")
+    SAVED_SEARCHES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SAVED_SEARCHES_FILE.with_suffix(".tmp")
     tmp.write_text("".join(f"{l}\n" for l in lines))
-    tmp.replace(CLEAN_SEARCHES)
-    CLEAN_TERMS[:] = lines
+    tmp.replace(SAVED_SEARCHES_FILE)
+    SAVED_SEARCHES[:] = lines
 
 
-def matches_clean_search(item):
+def matches_saved_search(item):
     """Any saved search appearing in the title, repo or number, ignoring case."""
     text = haystack(item)
-    return any(t.lower() in text for t in CLEAN_TERMS)
+    return any(t.lower() in text for t in SAVED_SEARCHES)
 
 
 def clean_reason(item, pr):
     """Why `clean` would sweep this, or None to leave it alone.
 
     Merged and open PRs are deliberately excluded: that work landed, or is live.
-    The saved searches are the one way past that, because they are a decision
-    about specific text rather than a guess from state.
     Derived from pr_status so the status column and the sweep cannot disagree.
     """
     status = pr_status(item, pr)
-    if status in CLEANABLE:
-        return item.subject_type if status == "other" else status
-    return "search" if matches_clean_search(item) else None
+    if status not in CLEANABLE:
+        return None
+    return item.subject_type if status == "other" else status
 
 
 # ---------------------------------------------------------------- actions
