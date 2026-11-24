@@ -63,7 +63,8 @@ What the template gives you, and what to keep when you change it:
   `signal: AbortSignal.timeout(60000)`.
 - **Pacing:** `window.probePauseMs = 500` by default, read before every request so
   the user can change it mid-run. Give them the console command
-  (`window.probePauseMs = 1000`) in the final log line.
+  (`window.probePauseMs = 1000`) in the final log line. This is a browser
+  preference only; it does not replace production ERP rate limiting.
 - **429:** use the server's actual delay (`retry-after` header, else
   `data.data.retryAfterSeconds`). Record a shared `cooldownUntil` and wait for it
   before any later request. No 30-second floor, no invented exponential backoff.
