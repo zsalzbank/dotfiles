@@ -29,9 +29,10 @@ and its permission checks stay authoritative.
 | Production, or any org | **Chrome console script** | The only option for production. |
 | Sandbox | Chrome console script, **or** the local ERP bridge | The bridge is **sandbox only**. |
 
-Default to the console script. Use the bridge only when the question needs the real
-client code path (Eclipse/P21 client logic, native readers, a local integration run)
-instead of hand-built HTTP calls, and only against sandbox.
+Default to the console script. Use the bridge against sandbox when the question
+needs the real client code path, or when a browser Origin header causes an upstream
+rejection. A small Node HTTP client through the existing bridge can compare reads
+without browser headers. Do not change the proxy or bypass its grants to run it.
 
 Start from `console-probe-template.js` in this skill's directory
 (`/mnt/personal/dotfiles/claude/skills/erp-probe/`). It already has the origin guard,
@@ -51,11 +52,14 @@ results back so you can read them.
 
 What the template gives you, and what to keep when you change it:
 
-- One async IIFE. First line guards the origin and throws a clear instruction:
+- One async IIFE. Always run from and guard the API origin:
   `https://api.canals.ai` for production, `https://sandbox.api.canals.ai` for
-  sandbox. Tell the user which `/ping` page to open.
-- Requests go to `${location.origin}/erp-proxy/${orgId}/${erpType}/${path}` with
-  `credentials: 'same-origin'`, `Accept: application/json`, and
+  sandbox. Open `/ping` on that domain before pasting into its Chrome console.
+  Do not require an app-domain tab or reject the API origin.
+- Use the guarded API origin for same-origin requests: `apiOrigin = location.origin`.
+  Requests go to
+  `${apiOrigin}/erp-proxy/${orgId}/${erpType}/${path}` with
+  `credentials: 'include'`, `Accept: application/json`, and
   `signal: AbortSignal.timeout(60000)`.
 - **Pacing:** `window.probePauseMs = 500` by default, read before every request so
   the user can change it mid-run. Give them the console command
@@ -79,7 +83,7 @@ What the template gives you, and what to keep when you change it:
 - Do not log tokens, cookies, or the Canals key.
 
 Hand-over: attach the `.js` file with the `add_attachment` MCP tool, then give the
-user the steps in one short block: open `<origin>/ping`, open DevTools console,
+user the steps in one short block: open the API origin's `/ping`, open DevTools console,
 paste the file contents, wait for the download, send it back.
 
 ## Local ERP bridge (sandbox only)
@@ -192,3 +196,39 @@ Not worth recording: org-specific ids, customer names, one-off results, or anyth
 that belongs in a planning doc. Keep tenant names out of the skill. Edit with the
 Edit tool, keep it terse, and remove or fix anything that turned out to be wrong.
 Don't commit or push the dotfiles repo unless the user asks.
+
+## ERP notes
+
+### Eclipse
+
+- For `API.GET.RECORDS` on `PROD.BR`, pass one explicit `branch` per request
+  and repeated plain product `id` values. Do not substitute composite
+  `product*branch` IDs without the branch parameter. That shape can return HTTP
+  200 with logical `400 Branch is invalid` in the response metadata. Validate
+  logical errors before decoding rows or continuing to comparison reads. Returned
+  IDs may be plain products or composites; qualify plain IDs only with the
+  explicit requested branch and reject unexpected identities.
+- `GET Products/{id}/ProductBranch?branch=...` can return `id: null` and omit
+  `productId`/`branchId`. Preserve the explicit request scope and check any
+  supplied identity for contradictions; do not require fields the endpoint does
+  not return. Keep request-scoped attribution distinct from response-confirmed
+  identity. A matching update key can support a native/REST comparison when it
+  is actually present and equal.
+
+### Infor
+
+- A browser probe can reach Infor through an allowed proxy request and still receive
+  an upstream invalid-origin response. Check proxy audit forwarding and the saved
+  upstream status/server headers before diagnosing Canals CORS. Proxy logs may
+  intentionally exclude response bodies. The proxy forwarder currently retains
+  Origin; it can trigger upstream CORS checks. Browser JavaScript cannot remove
+  that header. A proxy fix or an authenticated non-browser sandbox client requires
+  a separate validated baseline before interpreting absent case-variant results.
+- Verified read-only FetchWhere through a user-tunneled sandbox bridge using native
+  Node HTTP, without Origin. Response rows are in `ttblicsw`; `NoRecords` is a
+  successful read with no row, not a zero observation. A pricing response can name
+  a product/warehouse pair absent from icsw. Establish an actual table-row baseline
+  before comparing case variants. A bounded warehouse read can find candidates
+  without following its RestartRowID. Sampled SX.e exact equality returned the
+  same canonical IDs for upper/lower product and warehouse predicates; treat this
+  as provider-instance evidence, not a universal identity rule.

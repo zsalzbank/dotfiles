@@ -3,14 +3,15 @@
 // Question: <what this probe settles>
 // Why: <the decision or bug that made the question matter, PR numbers, live observation>
 // ✅ READ-ONLY
-// Usage: open <origin>/ping in the Chrome profile logged into Canals (not impersonating),
+// Usage: open <api-origin>/ping in the Chrome profile logged into Canals (not impersonating),
 //   paste into the DevTools console. Results download as <name>-results.json.
 //   Change pacing while running: window.probePauseMs = 1000
 (async () => {
   const ORIGIN = 'https://sandbox.api.canals.ai'; // https://api.canals.ai for production
   if (location.origin !== ORIGIN) {
-    throw new Error(`Open ${ORIGIN}/ping in the Chrome profile logged into Canals (not impersonating), then run this in its console.`);
+    throw new Error(`Open ${ORIGIN} in the Chrome profile logged into Canals (not impersonating), then run this in its console.`);
   }
+  const API_ORIGIN = location.origin;
   window.probePauseMs = window.probePauseMs ?? 500;
   let cooldownUntil = 0;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -29,12 +30,12 @@
   };
 
   const call = async ({orgId, erp}, method, path, body) => {
-    const url = `${location.origin}/erp-proxy/${orgId}/${erp}/${path}`;
+    const url = `${API_ORIGIN}/erp-proxy/${orgId}/${erp}/${path}`;
     while (true) {
       await sleep(Math.max(window.probePauseMs, cooldownUntil - Date.now()));
       const response = await fetch(url, {
         method,
-        credentials: 'same-origin',
+        credentials: 'include',
         headers: {Accept: 'application/json', ...(body === undefined ? {} : {'Content-Type': 'application/json'})},
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(60000),
