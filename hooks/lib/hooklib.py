@@ -33,23 +33,39 @@ IGNORE_DIR = Path(os.environ.get("DEVSPACES_HOOK_IGNORE_DIR",
                                  "/mnt/personal/hooks/state/ci-ignore"))
 
 
+PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy")
+
+
+def _custom_env() -> dict[str, str]:
+    try:
+        lines = CUSTOM_ENV_FILE.read_text().splitlines()
+    except OSError:
+        return {}
+    env = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            env[key] = value.strip().strip("'\"")
+    return env
+
+
 def skill(name: str) -> str:
     """Format a plugin skill invocation for the workspace's selected agent."""
-    frontend = os.environ.get("DEVSPACES_CLAUDE_FRONTEND")
-    if not frontend:
-        try:
-            for line in CUSTOM_ENV_FILE.read_text().splitlines():
-                key, separator, value = line.partition("=")
-                if separator and key == "DEVSPACES_CLAUDE_FRONTEND":
-                    frontend = value.strip().strip("'\"")
-                    break
-        except OSError:
-            pass
+    frontend = os.environ.get("DEVSPACES_CLAUDE_FRONTEND") or _custom_env().get("DEVSPACES_CLAUDE_FRONTEND")
     return f"${name}" if frontend == "codex" else f"/{name}"
+
+
+def load_egress_proxy() -> None:
+    """The dispatcher runs hooks without the egress proxy env, so `gh` hangs
+    until it times out. Take the proxy vars from the boot snapshot instead."""
+    for key, value in _custom_env().items():
+        if key in PROXY_KEYS:
+            os.environ.setdefault(key, value)
 
 
 def load_payload() -> dict:
     """Parse argv[1] as the event JSON; exit 0 (no-op) if missing/malformed."""
+    load_egress_proxy()
     if len(sys.argv) < 2 or not sys.argv[1].strip():
         print("no payload", file=sys.stderr)
         sys.exit(0)
